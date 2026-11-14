@@ -2,6 +2,7 @@
 
 class App;
 App *app_launcher_instance();
+App *app_familiar_instance();   // FAMILIAR — AI companion (custom firmware)
 App *app_badge_id_instance();
 App *app_onboarding_instance();
 App *app_progress_instance();

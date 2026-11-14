@@ -52,10 +52,96 @@ CONFIG_LV_FONT_MONTSERRAT_22=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18=y
 # LVGL pool: 40 KB OOM-crashed Mines9 (81 cells + 81 glyphs + labels, ~165
-# widgets) in lv_obj_class_create_obj's unchecked children realloc, so back
-# to 64 KB. The Sync snapshot / radio-init heap squeeze that motivated the
-# 40 KB cut needs a different fix (see heap `lv_max_used` vs sys_free).
-CONFIG_LV_MEM_SIZE_KILOBYTES=64
+# widgets) in lv_obj_class_create_obj's unchecked children realloc, so 64 KB was
+# safe. But the Claude TLS handshake is memory-starved: serial capture shows only
+# ~11 KB free once Wi-Fi is up, and the Wi-Fi driver then logs "mem fail" trying
+# to buffer Anthropic's certificate packets, so the handshake times out (le0x8006,
+# no mbedTLS error — the bytes are dropped before TLS sees them). The LVGL pool is
+# the one big reclaimable chunk; 48 KB frees 16 KB back to the system heap (→ ~27 KB
+# during TLS) while staying 8 KB above the 40 KB that crashed Mines9. Familiar's
+# screens (creature, chat labels) use far less than 48 KB.
+CONFIG_LV_MEM_SIZE_KILOBYTES=48
 CONFIG_LV_USE_FS_POSIX=y
 CONFIG_LV_FS_POSIX_LETTER=65
 CONFIG_LV_USE_QRCODE=y
+
+# ===== FAMILIAR Wi-Fi RAM diet =====
+# Stock Wi-Fi (32 RX + 32 TX dynamic buffers, AMPDU on, driver in IRAM) fails
+# esp_wifi_init() with ESP_ERR_NO_MEM on this badge: the heap is ~40-80 KB free
+# with a <=27 KB largest block once LVGL's 64 KB pool is carved out, and the
+# default driver wants far more contiguous RAM than that. Familiar is a
+# low-throughput API client (small JSON request, streamed SSE reply), not a
+# router, so trim buffers to the minimum that still associates and does one TLS
+# session, and keep Wi-Fi code in flash so its IRAM frees back to the heap on
+# this unified-SRAM part. Re-measure every change with the `wifiprobe` console
+# command. See main/familiar_net.cpp.
+#
+# UPDATE: the first diet (2 static / 6 dynamic RX) was tuned when the heap was
+# ~40-80 KB — BEFORE we unlocked ~130 KB by releasing the BLE controller before
+# every Wi-Fi flow. With only 2+6 RX buffers, the burst of back-to-back full-size
+# packets that carries Anthropic's TLS certificate overflowed the pool and got
+# dropped, so the handshake stalled and esp-tls timed out (le0x8006) even though
+# raw TCP connect to the same IP succeeded (an=0). Single small packets (DNS,
+# SNTP, the SYN) never hit the limit — exactly the symptom.
+#
+# Full defaults (10 static / 24 dynamic) made esp_wifi_init() fail NO_MEM, and
+# even 5/16 crushed the heap to ~7 KB after init (serial capture: "heap sta after
+# free=6912") — the BLE controller RAM is NOT reclaimable here (NimBLE stays up;
+# deinit is a one-way door in this firmware) and the chip only has ~147 KB total,
+# so there is no headroom for big RX pools. TLS needs that heap more than Wi-Fi
+# needs burst buffering, and the lean pool still reached the TLS handshake before.
+# Back to the minimum that associates and does one TLS session.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=2
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# Brownout: the stock firmware already sits at the least-sensitive level
+# (SEL_7 = 2.51 V) because it was tuned for low-power BLE. Wi-Fi's TX current
+# spike still sags the badge's supply below that floor and resets the chip
+# (observed: "Brownout detector was triggered" the instant the SoftAP starts
+# beaconing). We also cap Wi-Fi TX power in code (esp_wifi_set_max_tx_power) to
+# shrink the spike; with that in place, disable the detector so a brief,
+# recoverable dip can't reset mid-session. Safe here (USB/benchtop power);
+# revisit if we ever ship on bare AA cells.
+CONFIG_ESP_BROWNOUT_DET=n
+
+# ===== FAMILIAR lwIP diet =====
+# Familiar only ever holds one TCP connection at a time (the setup page, then a
+# single streamed HTTPS reply from Anthropic). Smaller windows, fewer sockets and
+# mailboxes free a few KB of the scarce heap so the HTTP server can serve while
+# Wi-Fi is up, and later so the TLS handshake fits.
+CONFIG_LWIP_MAX_SOCKETS=8
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=4
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=4
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+# IPv6 off: api.anthropic.com is dual-stack and DNS hands back an IPv6 address
+# first, but the badge has no IPv6 route, so connect() hung until timeout
+# (ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT, le0x8006). IPv4-only resolves that and
+# frees a little flash. The badge has no use for IPv6.
+CONFIG_LWIP_IPV6=n
+
+# MTU black hole fix: on a Bell (PPPoE, MTU 1492) home network the badge's small
+# packets (DNS, SNTP, the TCP SYN — proven by cf=0 reaching Cloudflare) get
+# through, but Anthropic's multi-KB TLS certificate arrives in ~1500-byte packets
+# that are too big for the PPPoE path and are silently dropped. The handshake then
+# stalls and esp-tls times out with le0x8006 (no mbedTLS error — the bytes never
+# arrive). Capping TCP MSS to 1200 forces both ends to use segments that fit any
+# PPPoE/VPN/tunnel path, so the certificate gets through. 1200 is conservative on
+# purpose; the request/reply are tiny so the small segment size costs us nothing.
+CONFIG_LWIP_TCP_MSS=1200
+
+# ===== FAMILIAR TLS RAM tuning =====
+# With Wi-Fi up the heap is fragmented; mbedTLS's default 16 KB static record
+# buffers can't get a contiguous block and the handshake dies with
+# MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00, seen on the badge: "TLS e-0xffff8100 f0x0").
+# Dynamic buffers allocate per-record (small during the handshake) and free
+# config data after, so the Anthropic TLS session fits the fragmented heap.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y

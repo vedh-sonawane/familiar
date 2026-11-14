@@ -104,3 +104,6 @@ Desktop.ini
 # Local inspection caches and raw device memory dumps, not deliverables.
 /outputs/**/*.inspect.ndjson
 /outputs/thumbnail-fix/capture-debug.txt
+
+# Local agent instructions (not a project deliverable)
+CLAUDE.md

@@ -20,6 +20,7 @@
 #include "ripple_state.h"
 #include "script_app.h"
 #include "sponsor_layout.h"
+#include "familiar_net.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1113,6 +1114,7 @@ void hal_console_start()
         { "xfer",   "Show the last sync transfer's stats",                    &cmd_xfer },
         { "radio",  "Radio diagnostics: radio [probe]; probe starts no advertisements or scan", &cmd_radio },
         { "heap",   "Heap usage: system heap plus LVGL pool",                &cmd_heap },
+        { "wifiprobe", "FAMILIAR: bring Wi-Fi up/down, log heap cost",       &familiar_wifiprobe_cmd },
         { "chess",  "Chess: chess [new|flip|move <uci>|fen <FEN>|perft <n>]", &cmd_chess },
         { "rm",     "Delete file: rm <path>",                                &cmd_rm },
         { "mkdir",  "Create directory (with parents): mkdir <path>",         &cmd_mkdir },

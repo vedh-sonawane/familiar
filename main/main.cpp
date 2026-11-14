@@ -89,6 +89,8 @@ extern "C" void app_main(void)
     // Default launcher order starts with My Badge (QR), Connect, Scanner,
     // Sync, Share, then the hunt and the remaining event tools.
     // My Badge is also the boot target below. Saved custom orders take priority.
+    // FAMILIAR leads the grid: our AI companion's living idle screen.
+    app_registry_add(app_familiar_instance());
     app_registry_add(app_badge_id_instance());
     app_registry_add(app_connect_instance());
     app_registry_add(app_scanner_instance());

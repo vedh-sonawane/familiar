@@ -1,5 +1,10 @@
 # Name,   Type, SubType, Offset,  Size
+# FAMILIAR: factory grown 0x2A0000 -> 0x350000 (3.31 MB) to fit the added Wi-Fi +
+# TLS + HTTP stack and later phases; storage (LittleFS) shrunk to 0xA0000 (640 KB,
+# baseline usage is ~45 KB). NVS (0x9000) is untouched so Wi-Fi creds + the
+# Anthropic API key stored there survive this re-flash. Changing storage's offset
+# reformats LittleFS once — identity.json / solana.json are backed up and restored.
 nvs,      data, nvs,     0x9000,  0x4000
 phy_init, data, phy,     0xd000,  0x1000
-factory,  app,  factory, 0x10000, 0x2A0000
-storage,  data, littlefs,,        0x140000
+factory,  app,  factory, 0x10000, 0x350000
+storage,  data, littlefs,,        0xA0000

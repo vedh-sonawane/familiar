@@ -1,7 +1,7 @@
 idf_component_register(
     SRC_DIRS "." "hal" "apps" "apps/icons_generated"
     INCLUDE_DIRS "." "hal" "apps"
-    PRIV_REQUIRES nvs_flash driver esp_lcd spi_flash console lua esp_event app_update bootloader_support bt json libsodium esp_app_format
+    PRIV_REQUIRES nvs_flash driver esp_lcd spi_flash console lua esp_event app_update bootloader_support bt json libsodium esp_app_format esp_wifi esp_netif esp_http_server esp_http_client esp-tls mbedtls
 )
 
 # LVGLImage.py-generated icons use `#ifdef LV_LVGL_H_INCLUDE_SIMPLE` to pick
