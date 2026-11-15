@@ -203,9 +203,22 @@ public:
             }
             return;
         }
-        // Chat is running on a worker task - ignore all buttons so A can't spawn
-        // a second, colliding network task. HOME still exits (registry → on_exit).
-        if (mode_ == Mode::Chat) return;
+        // Chat. Scrolling is always allowed; option/new-chat buttons only fire when
+        // the turn has fully finished (no worker task running), so A can never spawn
+        // a second colliding network task. HOME exits via the registry -> on_exit.
+        if (mode_ == Mode::Chat) {
+            if (ev.kind != ButtonEventKind::Pressed) return;
+            if (ev.button == Button::Up)   { if (chat_scroll_) lv_obj_scroll_by(chat_scroll_, 0,  44, LV_ANIM_ON); return; }
+            if (ev.button == Button::Down) { if (chat_scroll_) lv_obj_scroll_by(chat_scroll_, 0, -44, LV_ANIM_ON); return; }
+            bool busy = !chat_done_ || !chat_processed_;   // a turn is in flight
+            if (busy) return;
+            if (ev.button == Button::Start) { new_conversation(); return; }
+            int pick = (ev.button == Button::A)    ? 0
+                     : (ev.button == Button::B)    ? 1
+                     : (ev.button == Button::Left) ? 2 : -1;
+            if (pick >= 0 && pick < opt_n_) pick_option(pick);
+            return;
+        }
 
         // Creature. Start is a deliberate hold-to-reset (see on_tick); a tap does
         // nothing so it can't be mistaken for a reset. Track press/release here.
@@ -407,23 +420,143 @@ private:
     {
         auto *self = static_cast<FamiliarApp *>(arg);
         char err[64] = {0};
-        chat_status_cb("connecting to Wi-Fi...", self);
-        if (!familiar_net_sta_connect(60000, err, sizeof(err))) {   // WPA3 SAE: ~4 patient, spaced attempts
-            chat_status_cb(err[0] ? err : "Wi-Fi failed", self);
-            self->chat_done_ = true;
-            self->chat_task_ = nullptr;
-            vTaskDelete(nullptr);
-            return;
+        // Connect only if we don't already hold an IP: after the first turn the
+        // Wi-Fi link stays up, so follow-ups skip straight to the request.
+        if (!familiar_net_sta_has_ip()) {
+            chat_status_cb("connecting to Wi-Fi...", self);
+            if (!familiar_net_sta_connect(60000, err, sizeof(err))) {
+                chat_status_cb(err[0] ? err : "Wi-Fi failed", self);
+                self->chat_done_ = true;
+                self->chat_processed_ = true;   // nothing to parse
+                self->chat_task_ = nullptr;
+                vTaskDelete(nullptr);
+                return;
+            }
         }
         chat_status_cb("Claude is thinking...", self);
-        familiar_net_claude_stream(
-            "You are Familiar, a tiny AI companion living on a 12 dollar hacker "
-            "badge made at Hack the North. Greet your owner for the very first "
-            "time in 1 to 2 short, warm, playful sentences.",
+        // On the task stack (12KB), not static RAM: msgs is only needed to build
+        // the request body, and keeping it off the permanent heap leaves more room
+        // for the TLS certificate verification (which needs a ~4.4KB block).
+        char msgs[2048];
+        self->build_messages(msgs, sizeof(msgs));
+        familiar_net_claude_stream_msgs(kSysPrompt, msgs,
             &FamiliarApp::chat_delta_cb, &FamiliarApp::chat_status_cb, self);
         self->chat_done_ = true;
         self->chat_task_ = nullptr;
         vTaskDelete(nullptr);
+    }
+
+    // ---- multi-turn helpers ----------------------------------------------
+    static int json_escape(const char *in, char *out, int cap)
+    {
+        int o = 0;
+        for (const char *p = in; *p && o < cap - 3; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+            else if (c == '\n')        { out[o++] = '\\'; out[o++] = 'n'; }
+            else if (c == '\t')        { out[o++] = ' '; }
+            else if (c < 0x20)         { /* drop other control chars */ }
+            else                       { out[o++] = (char)c; }
+        }
+        out[o] = '\0';
+        return o;
+    }
+
+    void build_messages(char *out, int cap)
+    {
+        int o = 0;
+        o += snprintf(out + o, cap - o, "[");
+        for (int i = 0; i < hist_n_ && o < cap - 16; i++) {
+            char esc[kMsgMax * 2 + 4];
+            json_escape(hist_[i].text, esc, sizeof(esc));
+            o += snprintf(out + o, cap - o, "%s{\"role\":\"%s\",\"content\":\"%s\"}",
+                          i ? "," : "", hist_[i].user ? "user" : "assistant", esc);
+        }
+        snprintf(out + o, cap - o, "]");
+    }
+
+    void hist_add(bool user, const char *text)
+    {
+        if (hist_n_ >= kMaxTurns) {   // drop the oldest pair to keep the window small
+            int drop = 2;
+            for (int i = drop; i < hist_n_; i++) hist_[i - drop] = hist_[i];
+            hist_n_ -= drop;
+        }
+        hist_[hist_n_].user = user;
+        strlcpy(hist_[hist_n_].text, text, kMsgMax);
+        hist_n_++;
+    }
+
+    // Reset the streaming buffers and spawn a worker for the next turn.
+    void send_turn()
+    {
+        if (!chat_mu_) chat_mu_ = xSemaphoreCreateMutex();
+        xSemaphoreTake(chat_mu_, portMAX_DELAY);
+        chat_reply_len_ = 0;
+        chat_reply_buf_[0] = '\0';
+        strlcpy(chat_status_buf_, "Claude is thinking...", sizeof(chat_status_buf_));
+        chat_dirty_ = true;
+        xSemaphoreGive(chat_mu_);
+        chat_done_ = false;
+        chat_processed_ = false;
+        opt_n_ = 0;
+        for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_label_set_text(opt_lbl_[i], "");
+        if (chat_reply_) lv_label_set_text(chat_reply_, "");
+        xTaskCreate(&FamiliarApp::chat_task, "fam_chat", 12288, this, 5, &chat_task_);
+    }
+
+    void pick_option(int i)
+    {
+        hist_add(true, opt_[i]);
+        send_turn();
+    }
+
+    void new_conversation()
+    {
+        hist_n_ = 0;
+        hist_add(true, "Let us start fresh. Say hi and suggest what we could do!");
+        send_turn();
+    }
+
+    // Parse the finished reply: split off the OPTS line into the three follow-up
+    // buttons and commit the clean reply text to the conversation history.
+    void process_reply()
+    {
+        const char *opts = strstr(chat_reply_buf_, "OPTS:");
+        int n = opts ? (int)(opts - chat_reply_buf_) : (int)strlen(chat_reply_buf_);
+        char clean[kMsgMax];
+        if (n > kMsgMax - 1) n = kMsgMax - 1;
+        memcpy(clean, chat_reply_buf_, n);
+        clean[n] = '\0';
+        while (n > 0 && (clean[n - 1] == '\n' || clean[n - 1] == ' ' || clean[n - 1] == '\r'))
+            clean[--n] = '\0';
+        if (clean[0]) hist_add(false, clean);
+
+        opt_n_ = 0;
+        if (opts) {
+            char buf[160];
+            strlcpy(buf, opts + 5, sizeof(buf));   // text after "OPTS:"
+            char *tok = buf;
+            while (opt_n_ < 3 && tok && *tok) {
+                char *bar = strchr(tok, '|');
+                if (bar) *bar = '\0';
+                while (*tok == ' ' || *tok == '\n' || *tok == '\r') tok++;
+                int L = (int)strlen(tok);
+                while (L > 0 && (tok[L - 1] == ' ' || tok[L - 1] == '\n' || tok[L - 1] == '\r'))
+                    tok[--L] = '\0';
+                if (L > 0) { strlcpy(opt_[opt_n_], tok, sizeof(opt_[opt_n_])); opt_n_++; }
+                if (!bar) break;
+                tok = bar + 1;
+            }
+        }
+
+        const char *keycap[3] = {"A", "B", "LEFT"};
+        for (int i = 0; i < 3; i++) {
+            if (!opt_lbl_[i]) continue;
+            if (i < opt_n_) lv_label_set_text_fmt(opt_lbl_[i], "%s  %s", keycap[i], opt_[i]);
+            else            lv_label_set_text(opt_lbl_[i], "");
+        }
+        if (opt_n_ == 0 && opt_lbl_[0]) lv_label_set_text(opt_lbl_[0], "START  new chat");
     }
 
     void enter_chat(lv_obj_t *root)
@@ -437,50 +570,91 @@ private:
         hal_lights_clear(); hal_lights_show();
 
         mode_ = Mode::Chat;
-        chat_reply_len_ = 0;
-        chat_reply_buf_[0] = '\0';
-        strlcpy(chat_status_buf_, "waking up...", sizeof(chat_status_buf_));
-        chat_dirty_ = true;
-        chat_done_ = false;
         if (!chat_mu_) chat_mu_ = xSemaphoreCreateMutex();
 
         lv_obj_t *title = lv_label_create(root);
         lv_label_set_text(title, "FAMILIAR");
         lv_obj_set_style_text_color(title, lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
         lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
         chat_status_ = lv_label_create(root);
         lv_obj_set_style_text_color(chat_status_, lv_color_hex(BadgeTheme::TEXT_MUTED), 0);
         lv_obj_set_style_text_font(chat_status_, &lv_font_montserrat_14, 0);
-        lv_obj_align(chat_status_, LV_ALIGN_TOP_MID, 0, 28);
+        lv_obj_align(chat_status_, LV_ALIGN_TOP_MID, 0, 26);
 
-        chat_reply_ = lv_label_create(root);
+        // Scrollable transcript area: the reply label wraps inside and grows; the
+        // container scrolls so long replies stay readable (Up/Down to move).
+        chat_scroll_ = lv_obj_create(root);
+        lv_obj_set_size(chat_scroll_, 312, 106);
+        lv_obj_align(chat_scroll_, LV_ALIGN_TOP_MID, 0, 46);
+        lv_obj_set_style_bg_opa(chat_scroll_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(chat_scroll_, 0, 0);
+        lv_obj_set_style_pad_all(chat_scroll_, 2, 0);
+        lv_obj_set_scroll_dir(chat_scroll_, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(chat_scroll_, LV_SCROLLBAR_MODE_AUTO);
+
+        chat_reply_ = lv_label_create(chat_scroll_);
         lv_obj_set_style_text_color(chat_reply_, lv_color_hex(BadgeTheme::TEXT), 0);
-        lv_obj_set_style_text_font(chat_reply_, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_font(chat_reply_, &lv_font_montserrat_16, 0);
         lv_label_set_long_mode(chat_reply_, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(chat_reply_, 296);
-        lv_obj_align(chat_reply_, LV_ALIGN_TOP_LEFT, 12, 56);
+        lv_obj_set_pos(chat_reply_, 0, 0);
         lv_label_set_text(chat_reply_, "");
 
+        // Three follow-up slots, mapped to A / B / Left.
+        for (int i = 0; i < 3; i++) {
+            opt_lbl_[i] = lv_label_create(root);
+            lv_obj_set_style_text_color(opt_lbl_[i], lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
+            lv_obj_set_style_text_font(opt_lbl_[i], &lv_font_montserrat_14, 0);
+            lv_label_set_long_mode(opt_lbl_[i], LV_LABEL_LONG_DOT);
+            lv_obj_set_width(opt_lbl_[i], 300);
+            lv_obj_align(opt_lbl_[i], LV_ALIGN_TOP_LEFT, 10, 158 + i * 18);
+            lv_label_set_text(opt_lbl_[i], "");
+        }
+
         lv_obj_t *hint = lv_label_create(root);
-        lv_label_set_text(hint, "HOME to go back");
+        lv_label_set_text(hint, "A / B / LEFT reply   up-dn scroll   HOME exit");
         lv_obj_set_style_text_color(hint, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
         lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
 
-        // Worker owns the blocking network work; TLS needs a big stack.
-        xTaskCreate(&FamiliarApp::chat_task, "fam_chat", 12288, this, 5, &chat_task_);
+        // Fresh conversation: seed a first user turn that nudges a warm greeting.
+        hist_n_ = 0;
+        hist_add(true, "I just opened you on my badge. Say hi and suggest what we could do!");
+        send_turn();
     }
 
     void tick_chat()
     {
-        if (!chat_dirty_ || !chat_status_) return;
-        xSemaphoreTake(chat_mu_, portMAX_DELAY);
-        lv_label_set_text(chat_status_, chat_status_buf_);
-        if (chat_reply_) lv_label_set_text(chat_reply_, chat_reply_buf_);
-        chat_dirty_ = false;
-        xSemaphoreGive(chat_mu_);
+        if (chat_dirty_ && chat_status_) {
+            xSemaphoreTake(chat_mu_, portMAX_DELAY);
+            lv_label_set_text(chat_status_, chat_status_buf_);
+            if (chat_reply_) {
+                // Hide the trailing OPTS line while streaming: show only the text
+                // before it. The options become buttons once the turn finishes.
+                const char *opts = strstr(chat_reply_buf_, "OPTS:");
+                if (opts) {
+                    static char disp[1024];
+                    int n = (int)(opts - chat_reply_buf_);
+                    if (n > (int)sizeof(disp) - 1) n = sizeof(disp) - 1;
+                    memcpy(disp, chat_reply_buf_, n);
+                    while (n > 0 && (disp[n - 1] == '\n' || disp[n - 1] == ' ' || disp[n - 1] == '\r')) n--;
+                    disp[n] = '\0';
+                    lv_label_set_text(chat_reply_, disp);
+                } else {
+                    lv_label_set_text(chat_reply_, chat_reply_buf_);
+                }
+            }
+            chat_dirty_ = false;
+            xSemaphoreGive(chat_mu_);
+            if (chat_scroll_) lv_obj_scroll_to_y(chat_scroll_, LV_COORD_MAX, LV_ANIM_OFF);
+        }
+        // Turn finished: parse the OPTS line into buttons + commit to history once.
+        if (chat_done_ && !chat_processed_) {
+            process_reply();
+            chat_processed_ = true;
+        }
     }
 
     static bool is_transient(Mood m) { return m != Mood::Idle && m != Mood::Sleeping; }
@@ -686,13 +860,35 @@ private:
 
     // Chat: a worker task connects Wi-Fi and streams Claude's reply into shared
     // buffers (guarded by chat_mu_); tick_chat() renders them on the UI task.
-    lv_obj_t *chat_status_ = nullptr, *chat_reply_ = nullptr;
+    lv_obj_t *chat_status_ = nullptr, *chat_reply_ = nullptr, *chat_scroll_ = nullptr;
+    lv_obj_t *opt_lbl_[3] = {nullptr, nullptr, nullptr};
     SemaphoreHandle_t chat_mu_ = nullptr;
     TaskHandle_t chat_task_ = nullptr;
     char chat_reply_buf_[1024] = {0};
     int  chat_reply_len_ = 0;
     char chat_status_buf_[80] = {0};
     volatile bool chat_dirty_ = false, chat_done_ = false;
+    volatile bool chat_processed_ = true;   // parsed the finished reply + options yet
+
+    // Multi-turn conversation. Bounded so the request body stays small (memory is
+    // the #1 constraint): keep the last kMaxTurns messages, each <= kMsgMax chars.
+    static constexpr int kMaxTurns = 4;
+    static constexpr int kMsgMax   = 150;
+    struct ChatMsg { bool user; char text[kMsgMax]; };
+    ChatMsg hist_[kMaxTurns];
+    int  hist_n_ = 0;
+    char opt_[3][40] = {{0}};
+    int  opt_n_ = 0;
+
+    // System prompt: keep it free of double quotes and backslashes so it embeds in
+    // the JSON body with no escaping. Claude ends each reply with an OPTS line we
+    // parse into the three button-mapped follow-ups.
+    static constexpr const char *kSysPrompt =
+        "You are Familiar, a tiny AI companion living on a 12 dollar hacker badge built at Hack the "
+        "North. Keep every reply warm, playful and SHORT: 1 to 3 small sentences, this is a tiny "
+        "screen. After your reply, always add one final line in exactly this format: "
+        "OPTS: first | second | third  where each is a short thing the owner might tap to say next "
+        "(max 5 words each). Never use quotation marks or backslashes anywhere in your response.";
 
     Mood mood_ = Mood::Idle;
     int mood_ticks_ = 0;

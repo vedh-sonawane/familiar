@@ -42,6 +42,19 @@ int familiar_net_claude_stream(const char *prompt,
                                familiar_delta_cb on_delta,
                                familiar_status_cb on_status, void *ctx);
 
+// Multi-turn variant: send a full conversation. `system_prompt` is the system
+// string (plain, no JSON escaping done for you - keep it free of quotes and
+// backslashes). `messages_json` is a ready-built JSON array, e.g.
+//   [{"role":"user","content":"hi"},{"role":"assistant","content":"hey"}]
+// The caller is responsible for JSON-escaping any user text inside it. Streams
+// decoded reply text to on_delta. Assumes Wi-Fi is already connected, so it skips
+// the one-time diagnostic probes that the first-call path runs. Returns 0 on
+// success, negative on error (friendly reason via on_status first).
+int familiar_net_claude_stream_msgs(const char *system_prompt,
+                                    const char *messages_json,
+                                    familiar_delta_cb on_delta,
+                                    familiar_status_cb on_status, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

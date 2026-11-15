@@ -525,3 +525,84 @@ done:
     log_heap("tls after");
     return rc;
 }
+
+int familiar_net_claude_stream_msgs(const char *system_prompt,
+                                    const char *messages_json,
+                                    familiar_delta_cb on_delta,
+                                    familiar_status_cb on_status, void *ctx)
+{
+    char key[FAMILIAR_KEY_MAX + 1] = {0};
+    char model[FAMILIAR_MODEL_MAX + 1] = {0};
+    if (!familiar_cfg_get(FAMILIAR_K_APIKEY, key, sizeof(key), nullptr)) {
+        if (on_status) on_status("no API key", ctx);
+        return -1;
+    }
+    familiar_cfg_get(FAMILIAR_K_MODEL_CHAT, model, sizeof(model), FAMILIAR_DEFAULT_MODEL_CHAT);
+
+    // Body holds the system prompt + the whole (bounded) conversation. The caller
+    // caps history so this stays well under the buffer.
+    static char body[2560];
+    int blen = snprintf(body, sizeof(body),
+        "{\"model\":\"%s\",\"max_tokens\":200,\"stream\":true,"
+        "\"system\":\"%s\",\"messages\":%s}",
+        model, system_prompt ? system_prompt : "", messages_json);
+    if (blen <= 0 || blen >= (int)sizeof(body)) {
+        if (on_status) on_status("message too long", ctx);
+        return -7;
+    }
+    log_heap("msg tls before");
+
+    // Lean path: the connection is already proven (first call ran the probes), so
+    // go straight to the HTTPS POST. One fresh TLS session per turn; Wi-Fi stays up.
+    esp_http_client_config_t cfg = {};
+    cfg.url = "https://api.anthropic.com/v1/messages";
+    cfg.method = HTTP_METHOD_POST;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.timeout_ms = 30000;
+    cfg.buffer_size = 2048;
+    cfg.buffer_size_tx = 1536;
+    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
+    if (!cl) { if (on_status) on_status("http init failed", ctx); return -2; }
+
+    esp_http_client_set_header(cl, "x-api-key", key);
+    esp_http_client_set_header(cl, "anthropic-version", "2023-06-01");
+    esp_http_client_set_header(cl, "content-type", "application/json");
+
+    int rc = 0;
+    esp_err_t err = esp_http_client_open(cl, blen);
+    if (err != ESP_OK) { if (on_status) on_status("couldn't reach Claude", ctx); rc = -3; goto mdone; }
+    if (esp_http_client_write(cl, body, blen) < 0) { if (on_status) on_status("send failed", ctx); rc = -4; goto mdone; }
+
+    {
+        esp_http_client_fetch_headers(cl);
+        int status = esp_http_client_get_status_code(cl);
+        log_heap("msg tls connected");
+        if (status != 200) {
+            char ebuf[256];
+            int en = esp_http_client_read(cl, ebuf, sizeof(ebuf) - 1);
+            if (en < 0) en = 0;
+            ebuf[en] = '\0';
+            const char *m = strstr(ebuf, "\"message\":\"");
+            char reason[80];
+            if (m) decode_json_str(m + 11, reason, sizeof(reason));
+            else   snprintf(reason, sizeof(reason), "HTTP %d", status);
+            ESP_LOGE(TAG, "claude %d: %s", status, ebuf);
+            if (on_status) on_status(reason, ctx);
+            rc = -5; goto mdone;
+        }
+        if (on_status) on_status("", ctx);
+        StreamCtx sc = {}; sc.on_delta = on_delta; sc.ctx = ctx;
+        char rbuf[1024];
+        while (true) {
+            int n = esp_http_client_read(cl, rbuf, sizeof(rbuf));
+            if (n <= 0) break;
+            feed_sse(&sc, rbuf, n);
+        }
+    }
+
+mdone:
+    esp_http_client_close(cl);
+    esp_http_client_cleanup(cl);
+    log_heap("msg tls after");
+    return rc;
+}

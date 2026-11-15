@@ -57,10 +57,11 @@ CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18=y
 # ~11 KB free once Wi-Fi is up, and the Wi-Fi driver then logs "mem fail" trying
 # to buffer Anthropic's certificate packets, so the handshake times out (le0x8006,
 # no mbedTLS error — the bytes are dropped before TLS sees them). The LVGL pool is
-# the one big reclaimable chunk; 48 KB frees 16 KB back to the system heap (→ ~27 KB
-# during TLS) while staying 8 KB above the 40 KB that crashed Mines9. Familiar's
-# screens (creature, chat labels) use far less than 48 KB.
-CONFIG_LV_MEM_SIZE_KILOBYTES=48
+# the one big reclaimable chunk. 44 KB frees 20 KB back to the system heap so the
+# multi-turn chat (extra history buffers) still has room for the TLS certificate
+# verification (a ~4.4 KB alloc), while staying 4 KB above the 40 KB that crashed
+# Mines9. Familiar's screens (creature, chat labels) use far less than 44 KB.
+CONFIG_LV_MEM_SIZE_KILOBYTES=44
 CONFIG_LV_USE_FS_POSIX=y
 CONFIG_LV_FS_POSIX_LETTER=65
 CONFIG_LV_USE_QRCODE=y

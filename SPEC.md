@@ -252,3 +252,15 @@ Familiar is a platform, not a chatbot. On top of Chat/Hands/Forge/Senses/Memory/
   (esp. Mines9) still run at 48KB LVGL; strip the diagnostic code (cf/an tcp probes, verbose scan
   logging, the double TLS connect from the leftover probe). **Next: Phase 2 - Chat** (multi-turn,
   streaming word-wrap + scroll, 3 button-mapped follow-ups, D-pad keyboard, saved conversations).
+- **2026-11-14 - PHASE 2 (part 1) DONE: multi-turn chat with button-mapped follow-ups.** Press A on
+  the creature and Familiar holds a real conversation. Each reply streams in word-wrapped to a
+  scrollable view (Up/Down scroll), and ends with three short follow-up suggestions parsed from an
+  OPTS line and mapped to A / B / LEFT, so a whole conversation runs on buttons alone. Start begins a
+  fresh chat; Home exits. New networking entry point familiar_net_claude_stream_msgs sends the full
+  bounded history (last kMaxTurns messages) plus a system prompt, and reuses the Wi-Fi link between
+  turns (no reconnect). Memory note: the multi-turn buffers cost ~8 KB and re-broke the TLS cert
+  verification (Dynamic alloc 4437 failed, mbedtls -0x3000). Reclaimed it by moving the message
+  builder to the task stack, shrinking buffers (chat_reply 1024, body 2560, history 4x150), capping
+  max_tokens at 200, and LVGL 48 -> 44 KB. Verified on badge: 4 turns, cert validated every turn,
+  heap steady at ~27 KB free after each turn, no leak. **Next in Phase 2: D-pad keyboard** to type
+  your own prompt (not just the suggestions), then saved conversations on flash.
