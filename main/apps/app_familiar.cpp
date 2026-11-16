@@ -199,6 +199,11 @@ public:
                 else              enter_chat(root_, cl_ids_[cl_sel_ - 1]); // reopen
                 return;
             }
+            if (ev.button == Button::B && cl_sel_ > 0) {   // delete the highlighted chat
+                delete_chat(cl_ids_[cl_sel_ - 1]);
+                enter_chat_list(root_);                    // rebuild the list
+                return;
+            }
             return;   // HOME exits the app via the registry
         }
 
@@ -531,7 +536,8 @@ private:
         streaming_bubble_ = nullptr;
         opt_n_ = 0;
         for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_label_set_text(opt_lbl_[i], "");
-        if (chat_status_) lv_label_set_text(chat_status_, "Ask anything");
+        if (chat_status_) lv_label_set_text(chat_status_, "");
+        show_greeting();
         chat_done_ = true;
         chat_processed_ = true;
     }
@@ -604,6 +610,12 @@ private:
             fclose(f);
         }
         if (!out[0]) snprintf(out, cap, "chat %d", id);
+    }
+
+    void delete_chat(int id)
+    {
+        char path[64]; chat_path(id, path, sizeof(path));
+        remove(path);
     }
 
     void scan_chats()
@@ -680,7 +692,7 @@ private:
         }
 
         lv_obj_t *hint = lv_label_create(root);
-        lv_label_set_text(hint, "up/dn pick   A open   HOME exit");
+        lv_label_set_text(hint, "up/dn   A open   B delete   HOME exit");
         lv_obj_set_style_text_color(hint, lv_color_hex(Cl::MUTED), 0);
         lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
         lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -700,7 +712,7 @@ private:
         // The bubble shows the WHOLE reply (never truncated). Only the copy kept as
         // conversation CONTEXT is capped at kMsgMax to keep the request body small.
         if (streaming_bubble_) {
-            static char full[2048];
+            static char full[1536];
             int fn = full_n; if (fn > (int)sizeof(full) - 1) fn = sizeof(full) - 1;
             memcpy(full, chat_reply_buf_, fn); full[fn] = '\0';
             lv_label_set_text(streaming_bubble_, full[0] ? full : "(no reply)");
@@ -794,7 +806,8 @@ private:
             int len = (int)strlen(kKbRows[r]);
             int rowy = y0 + r * 27;
             if (r == 4) {
-                kb_keys_[4][0] = make_key("space", 60, rowy, 200, 24);
+                kb_keys_[4][0] = make_key("space", 20, rowy, 168, 24);
+                kb_keys_[4][1] = make_key("del",   196, rowy, 92, 24);
             } else {
                 int x0 = 6 + ((10 - len) * 31) / 2;
                 for (int c = 0; c < len; c++) {
@@ -832,24 +845,29 @@ private:
         }
     }
 
+    int kb_row_len(int r) { return (r == 4) ? 2 : (int)strlen(kKbRows[r]); }  // row 4 = space + del
+
     void kb_move(int dr, int dc)
     {
         kb_highlight(kb_row_, kb_col_, false);
         if (dr) {
             kb_row_ = clampi(kb_row_ + dr, 0, 4);
-            int len = (int)strlen(kKbRows[kb_row_]);
-            kb_col_ = clampi(kb_col_, 0, len - 1);
+            kb_col_ = clampi(kb_col_, 0, kb_row_len(kb_row_) - 1);
         }
         if (dc) {
-            int len = (int)strlen(kKbRows[kb_row_]);
-            kb_col_ = clampi(kb_col_ + dc, 0, len - 1);
+            kb_col_ = clampi(kb_col_ + dc, 0, kb_row_len(kb_row_) - 1);
         }
         kb_highlight(kb_row_, kb_col_, true);
     }
 
     void kb_type()
     {
-        char ch = (kb_row_ == 4) ? ' ' : kKbRows[kb_row_][kb_col_];
+        if (kb_row_ == 4) {                      // bottom row: space or del
+            if (kb_col_ == 1) { kb_backspace(); return; }
+            if (kb_len_ < (int)sizeof(kb_text_) - 1) { kb_text_[kb_len_++] = ' '; kb_text_[kb_len_] = '\0'; kb_update_line(); }
+            return;
+        }
+        char ch = kKbRows[kb_row_][kb_col_];
         if (kb_len_ < (int)sizeof(kb_text_) - 1) {
             kb_text_[kb_len_++] = ch;
             kb_text_[kb_len_] = '\0';
@@ -870,6 +888,7 @@ private:
         title_ = mood_label_ = hint_ = zzz_ = nullptr;
         shadow_ = antenna_ = tip_ = body_ = nullptr;
         eye_l_ = eye_r_ = pupil_l_ = pupil_r_ = mouth_ = cheek_l_ = cheek_r_ = nullptr;
+        greeting_ = nullptr;   // was deleted by lv_obj_clean
         hal_lights_clear(); hal_lights_show();
 
         mode_ = Mode::Chat;
@@ -893,7 +912,7 @@ private:
         // The transcript: a vertical flex-column scroll of message bubbles. Every
         // message gets its own bubble, so scrolling shows the whole conversation.
         chat_scroll_ = lv_obj_create(root);
-        lv_obj_set_size(chat_scroll_, 316, 150);
+        lv_obj_set_size(chat_scroll_, 316, 146);
         lv_obj_align(chat_scroll_, LV_ALIGN_TOP_MID, 0, 28);
         lv_obj_set_style_bg_opa(chat_scroll_, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(chat_scroll_, 0, 0);
@@ -913,7 +932,7 @@ private:
             lv_obj_set_style_text_font(opt_lbl_[i], &lv_font_montserrat_14, 0);
             lv_label_set_long_mode(opt_lbl_[i], LV_LABEL_LONG_DOT);
             lv_obj_set_width(opt_lbl_[i], 300);
-            lv_obj_align(opt_lbl_[i], LV_ALIGN_BOTTOM_LEFT, 10, -44 + i * 16);
+            lv_obj_align(opt_lbl_[i], LV_ALIGN_BOTTOM_LEFT, 10, -60 + i * 18);
             lv_label_set_text(opt_lbl_[i], "");
         }
 
@@ -939,10 +958,11 @@ private:
             lv_label_set_text(chat_status_, "RIGHT to type");
             if (chat_scroll_) lv_obj_scroll_to_y(chat_scroll_, LV_COORD_MAX, LV_ANIM_OFF);
         } else {
-            // Brand new empty chat. Normal Claude: no auto-greeting, the user asks.
+            // Brand new empty chat: a short randomized greeting, the user asks.
             cur_chat_id_ = next_chat_id();
             hist_n_ = 0;
-            lv_label_set_text(chat_status_, "Ask anything");
+            lv_label_set_text(chat_status_, "");
+            show_greeting();
         }
         chat_done_ = true;
         chat_processed_ = true;
@@ -977,11 +997,33 @@ private:
         return b;
     }
 
+    static const char *rand_greeting()
+    {
+        static const char *g[] = {
+            "Hey there.", "What's up?", "Hi!", "Ask me anything.",
+            "Ready when you are.", "What's on your mind?", "Let's chat.",
+            "How can I help?", "Hello.", "Go ahead, ask away.",
+        };
+        return g[esp_random() % (sizeof(g) / sizeof(g[0]))];
+    }
+
+    // A short, friendly greeting centred on an otherwise-empty new chat.
+    void show_greeting()
+    {
+        if (greeting_) { lv_obj_del(greeting_); greeting_ = nullptr; }
+        greeting_ = lv_label_create(root_);
+        lv_label_set_text(greeting_, rand_greeting());
+        lv_obj_set_style_text_color(greeting_, lv_color_hex(Cl::TEXT), 0);
+        lv_obj_set_style_text_font(greeting_, &lv_font_montserrat_24, 0);
+        lv_obj_align(greeting_, LV_ALIGN_CENTER, 0, -14);
+    }
+
     // Send a user message: show its bubble, record it, open an empty Claude bubble
     // to stream into, and wake the worker.
     void submit_user(const char *text)
     {
         if (!text || !text[0]) return;
+        if (greeting_) { lv_obj_del(greeting_); greeting_ = nullptr; }   // first message clears it
         add_bubble(true, text);
         hist_add(true, text);
         streaming_bubble_ = add_bubble(false, "...");
@@ -997,7 +1039,7 @@ private:
                 // Show the reply so far minus the trailing OPTS line (which becomes
                 // the follow-up chips once the turn finishes).
                 const char *opts = strstr(chat_reply_buf_, "OPTS:");
-                static char disp[2048];
+                static char disp[1536];
                 int n = opts ? (int)(opts - chat_reply_buf_) : (int)strlen(chat_reply_buf_);
                 if (n > (int)sizeof(disp) - 1) n = sizeof(disp) - 1;
                 memcpy(disp, chat_reply_buf_, n);
@@ -1223,13 +1265,14 @@ private:
     lv_obj_t *opt_lbl_[3] = {nullptr, nullptr, nullptr};
     // Claude-style transcript: one label per message in a flex-column scroll.
     lv_obj_t *streaming_bubble_ = nullptr;   // the Claude bubble being streamed into
+    lv_obj_t *greeting_ = nullptr;           // centered greeting on an empty new chat
     int msg_count_ = 0;
     // Home screen: the Claude sunburst logo drawn as one polyline through centre.
     lv_obj_t *logo_line_ = nullptr, *home_name_ = nullptr, *home_hint_ = nullptr;
     lv_point_precise_t logo_pts_[26];
     SemaphoreHandle_t chat_mu_ = nullptr;
     TaskHandle_t chat_worker_ = nullptr;   // one persistent turn-runner per session
-    char chat_reply_buf_[2048] = {0};
+    char chat_reply_buf_[1536] = {0};
     int  chat_reply_len_ = 0;
     char chat_status_buf_[80] = {0};
     volatile bool chat_dirty_ = false, chat_done_ = false;

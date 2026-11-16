@@ -204,9 +204,10 @@ bool familiar_net_sta_connect(int timeout_ms, char *out_err, int out_err_sz)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wc));
     err = esp_wifi_start();
     if (err != ESP_OK) { if (out_err) strlcpy(out_err, "wifi start failed", out_err_sz); return false; }
-    // TX power: 52 = 13 dBm. Association is reliable now via the BSSID pin, so the
-    // high 18 dBm setting is not needed, and its bigger current spike browns out
-    // weak AA batteries. 13 dBm still reaches the router fine at the observed RSSI.
+    // TX power: 52 = 13 dBm, the value proven not to crash on batteries. 18 dBm (72)
+    // reset the chip on battery - the transmit current spike sags the cells below
+    // the (disabled) brownout floor. For weak-signal spots use a wall charger or
+    // stay closer to the router; the badge cannot blast Wi-Fi far on battery power.
     esp_wifi_set_max_tx_power(52);
     // Disable Wi-Fi power-save. With the default min-modem power save the radio
     // sleeps between beacons and drops the TCP SYN-ACK, so UDP (DNS, SNTP) works
@@ -321,13 +322,34 @@ bool familiar_net_sta_has_ip(void) { return s_have_ip; }
 
 // ---- minimal JSON string-value decoder for the SSE delta text ----------------
 
+// Map a Unicode codepoint to the ASCII the badge font can render. Claude emits
+// smart punctuation (em dashes, curly quotes, ellipsis) which otherwise shows as
+// tofu boxes; fold them to plain ASCII and drop anything else non-ASCII.
+static void emit_cp(int cp, char *out, int *o, int out_sz)
+{
+    const char *rep;
+    char one[2] = {0, 0};
+    switch (cp) {
+        case 0x2014: case 0x2013: case 0x2212: case 0x2022: rep = "-";  break;  // dashes/bullet
+        case 0x2018: case 0x2019: case 0x2032: rep = "'";   break;             // curly ' and prime
+        case 0x201C: case 0x201D: case 0x2033: rep = "\"";  break;             // curly "
+        case 0x2026: rep = "...";  break;                                      // ellipsis
+        case 0x00A0: rep = " ";    break;                                      // nbsp
+        default:
+            if (cp >= 32 && cp < 127) { one[0] = (char)cp; rep = one; }
+            else rep = "";   // drop other non-ASCII (emoji, accents the font lacks)
+    }
+    for (const char *p = rep; *p && *o < out_sz - 1; p++) out[(*o)++] = *p;
+}
+
 // Given a pointer just past `"text":"`, decode the JSON string into out (bounded),
-// stopping at the closing quote. Handles the escapes Claude actually emits.
+// stopping at the closing quote. Handles the escapes Claude actually emits, plus
+// raw UTF-8 bytes (folded to ASCII by emit_cp).
 static int decode_json_str(const char *src, char *out, int out_sz)
 {
     int o = 0;
     for (int i = 0; src[i] && o < out_sz - 1; i++) {
-        char c = src[i];
+        unsigned char c = (unsigned char)src[i];
         if (c == '"') break;                    // end of string
         if (c == '\\') {
             char n = src[++i];
@@ -335,20 +357,29 @@ static int decode_json_str(const char *src, char *out, int out_sz)
                 case 'n': out[o++] = '\n'; break;
                 case 't': out[o++] = ' ';  break;
                 case 'r': break;
-                case 'u': {                      // \uXXXX -> keep ASCII, else '?'
+                case 'u': {                      // \uXXXX -> folded to ASCII
                     int v = 0; for (int k = 0; k < 4 && src[i + 1]; k++) {
                         char h = src[++i]; v <<= 4;
                         v |= (h >= '0' && h <= '9') ? h - '0'
                            : (h >= 'a' && h <= 'f') ? h - 'a' + 10
                            : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : 0;
                     }
-                    out[o++] = (v >= 32 && v < 127) ? (char)v : '?';
+                    emit_cp(v, out, &o, out_sz);
                     break;
                 }
                 default: out[o++] = n; break;    // \" \\ \/ etc.
             }
+        } else if (c < 0x80) {
+            out[o++] = (char)c;                  // plain ASCII
         } else {
-            out[o++] = c;
+            // Raw UTF-8 multibyte sequence: decode the codepoint, then fold.
+            int cp = 0, extra = 0;
+            if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; extra = 1; }
+            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
+            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
+            else continue;               // stray continuation byte
+            for (int k = 0; k < extra && src[i + 1]; k++) cp = (cp << 6) | (src[++i] & 0x3F);
+            emit_cp(cp, out, &o, out_sz);
         }
     }
     out[o] = '\0';
@@ -581,7 +612,7 @@ int familiar_net_claude_stream_msgs(const char *system_prompt,
     // hallucinating. The caller caps history so this stays under the buffer.
     static char body[2560];
     int blen = snprintf(body, sizeof(body),
-        "{\"model\":\"%s\",\"max_tokens\":350,\"stream\":true,"
+        "{\"model\":\"%s\",\"max_tokens\":280,\"stream\":true,"
         "\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3}],"
         "\"system\":\"%s\",\"messages\":%s}",
         model, system_prompt ? system_prompt : "", messages_json);
