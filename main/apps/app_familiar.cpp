@@ -18,11 +18,13 @@
 #include "familiar_config.h"
 #include "familiar_setup.h"
 #include "familiar_net.h"
+#include "hal_fs.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 
 #include "esp_random.h"
 #include "esp_system.h"   // esp_restart
@@ -38,22 +40,19 @@ constexpr int kCy = 116;   // creature centre y (240 tall)
 
 constexpr int kSleepAfterTicks = 600;   // ~12 s at 50 Hz before a nap
 
+// Claude's look: warm off-white background, near-black warm text, coral accent.
+namespace Cl {
+    constexpr uint32_t BG      = 0xF5F4EE;   // Claude cream / off-white
+    constexpr uint32_t TEXT    = 0x262624;   // warm near-black
+    constexpr uint32_t MUTED   = 0x83817A;   // muted warm gray
+    constexpr uint32_t CORAL   = 0xC15F3C;   // Claude coral (deeper, for light bg)
+    constexpr uint32_t USERBUB = 0xE7E5DC;   // user message pill
+    constexpr uint32_t SELTEXT = 0xFFFFFF;   // text on a coral-highlighted row
+}
+
 inline int   clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// A bare filled rectangle/circle: no theme chrome, no scrollbar, no padding.
-lv_obj_t *clean_box(lv_obj_t *parent, uint32_t color, int w, int h)
-{
-    lv_obj_t *o = lv_obj_create(parent);
-    lv_obj_set_size(o, w, h);
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(o, 0, 0);
-    lv_obj_set_style_border_width(o, 0, 0);
-    lv_obj_set_style_radius(o, 0, 0);
-    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-    return o;
-}
 
 enum class Mood : uint8_t { Idle, Happy, Thinking, Surprised, Sleeping };
 
@@ -82,8 +81,8 @@ const char *mood_word(Mood m)
 
 class FamiliarApp : public App {
 public:
-    const char *name() const override { return "Familiar"; }
-    const char *icon() const override { return ":3"; }
+    const char *name() const override { return "Claude"; }
+    const char *icon() const override { return "*"; }
     const char *slug() const override { return "familiar"; }
     AppAccess   access() const override { return AppAccess::Default; }
 
@@ -96,79 +95,60 @@ public:
         // the creature. Everything else below is the creature screen.
         if (!familiar_cfg_is_configured()) { enter_setup(root); return; }
 
+        // HOME: the Claude logo on a warm charcoal screen. Tilt stretches the rays.
         mode_ = Mode::Creature;
-        mood_ = Mood::Idle;
-        mood_ticks_ = 0;
-        idle_ticks_ = 0;
         frame_ = 0;
         look_x_ = look_y_ = look_tx_ = look_ty_ = 0.f;
-        blink_ = 0;
-        next_blink_ = 120 + (int)(esp_random() % 120);
-        led_phase_ = 0;
 
-        title_ = lv_label_create(root);
-        lv_label_set_text(title_, "FAMILIAR");
-        lv_obj_set_style_text_color(title_, lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
-        lv_obj_set_style_text_font(title_, &lv_font_montserrat_14, 0);
-        lv_obj_align(title_, LV_ALIGN_TOP_MID, 0, 8);
+        lv_obj_set_style_bg_color(root, lv_color_hex(Cl::BG), 0);
+        lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
 
-        mood_label_ = lv_label_create(root);
-        lv_obj_set_style_text_color(mood_label_, lv_color_hex(BadgeTheme::TEXT_MUTED), 0);
-        lv_obj_set_style_text_font(mood_label_, &lv_font_montserrat_14, 0);
-        lv_obj_align(mood_label_, LV_ALIGN_TOP_MID, 0, 26);
+        logo_line_ = lv_line_create(root);
+        lv_obj_set_pos(logo_line_, 0, 0);
+        lv_obj_set_size(logo_line_, 320, 190);
+        lv_obj_set_style_line_color(logo_line_, lv_color_hex(Cl::CORAL), 0);
+        lv_obj_set_style_line_width(logo_line_, 5, 0);
+        lv_obj_set_style_line_rounded(logo_line_, true, 0);
 
-        // Soft ground shadow for grounding; squashes as the creature bounces.
-        shadow_ = clean_box(root, 0x120a13, 120, 20);
-        lv_obj_set_style_radius(shadow_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(shadow_, LV_OPA_60, 0);
+        home_name_ = lv_label_create(root);
+        lv_label_set_text(home_name_, "Claude");
+        lv_obj_set_style_text_color(home_name_, lv_color_hex(Cl::TEXT), 0);
+        lv_obj_set_style_text_font(home_name_, &lv_font_montserrat_24, 0);
+        lv_obj_align(home_name_, LV_ALIGN_CENTER, 0, 52);
 
-        // Antenna (stalk + glowing tip), drawn behind the body.
-        antenna_ = clean_box(root, BadgeTheme::BORDER, 3, 24);
-        tip_ = clean_box(root, mood_hue(Mood::Idle), 12, 12);
-        lv_obj_set_style_radius(tip_, LV_RADIUS_CIRCLE, 0);
+        home_hint_ = lv_label_create(root);
+        lv_label_set_text(home_hint_, "press A to chat");
+        lv_obj_set_style_text_color(home_hint_, lv_color_hex(Cl::MUTED), 0);
+        lv_obj_set_style_text_font(home_hint_, &lv_font_montserrat_14, 0);
+        lv_obj_align(home_hint_, LV_ALIGN_BOTTOM_MID, 0, -8);
 
-        // Body.
-        body_ = clean_box(root, BadgeTheme::ACCENT, kBodyW, kBodyH);
-        lv_obj_set_style_radius(body_, 28, 0);
-        lv_obj_set_style_border_width(body_, 2, 0);
-        lv_obj_set_style_border_color(body_, lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
-
-        // Cheeks (shown when happy).
-        cheek_l_ = clean_box(root, 0xe08a9a, 12, 7);
-        cheek_r_ = clean_box(root, 0xe08a9a, 12, 7);
-        lv_obj_set_style_radius(cheek_l_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_radius(cheek_r_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_add_flag(cheek_l_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(cheek_r_, LV_OBJ_FLAG_HIDDEN);
-
-        // Eyes + pupils.
-        eye_l_ = clean_box(root, BadgeTheme::TEXT, kEye, kEye);
-        eye_r_ = clean_box(root, BadgeTheme::TEXT, kEye, kEye);
-        lv_obj_set_style_radius(eye_l_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_radius(eye_r_, LV_RADIUS_CIRCLE, 0);
-        pupil_l_ = clean_box(root, 0x120a13, kPupil, kPupil);
-        pupil_r_ = clean_box(root, 0x120a13, kPupil, kPupil);
-        lv_obj_set_style_radius(pupil_l_, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_radius(pupil_r_, LV_RADIUS_CIRCLE, 0);
-
-        // Mouth.
-        mouth_ = clean_box(root, 0x2a0f1a, 20, 6);
-        lv_obj_set_style_radius(mouth_, LV_RADIUS_CIRCLE, 0);
-
-        zzz_ = lv_label_create(root);
-        lv_label_set_text(zzz_, "z Z z");
-        lv_obj_set_style_text_color(zzz_, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
-        lv_obj_set_style_text_font(zzz_, &lv_font_montserrat_18, 0);
-        lv_obj_add_flag(zzz_, LV_OBJ_FLAG_HIDDEN);
-
-        hint_ = lv_label_create(root);
-        lv_label_set_text(hint_, "A talk to Claude   B think   HOME exit");
-        lv_obj_set_style_text_color(hint_, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
-        lv_obj_set_style_text_font(hint_, &lv_font_montserrat_14, 0);
-        lv_obj_align(hint_, LV_ALIGN_BOTTOM_MID, 0, -8);
-
-        sync_mood_label();
         render();
+    }
+
+    // Draw the Claude sunburst as one polyline that zig-zags out to each ray tip
+    // and back through the centre. Rays breathe, slowly rotate, and stretch toward
+    // however the badge is tilted (look_x_/look_y_ track the accelerometer).
+    void render_home()
+    {
+        if (!logo_line_) return;
+        const int cx = 160, cy = 84;
+        const int kRays = 12;
+        const float t = frame_ * 0.05f;
+        for (int i = 0; i < kRays; i++) {
+            float ang = (float)i / kRays * 6.2832f + t * 0.12f;
+            float dx = cosf(ang), dy = sinf(ang);
+            float tilt  = dx * look_x_ * 2.4f + dy * look_y_ * 2.4f;
+            float pulse = 5.f * sinf(t * 1.4f + i * 0.5f);
+            float R = 42.f + pulse + tilt;
+            if (R < 16.f) R = 16.f;
+            logo_pts_[2 * i].x     = (lv_coord_t)(cx + lroundf(dx * R));
+            logo_pts_[2 * i].y     = (lv_coord_t)(cy + lroundf(dy * R));
+            logo_pts_[2 * i + 1].x = cx;
+            logo_pts_[2 * i + 1].y = cy;
+        }
+        logo_pts_[2 * kRays].x = (lv_coord_t)(cx + 42);
+        logo_pts_[2 * kRays].y = cy;
+        lv_line_set_points(logo_line_, logo_pts_, 2 * kRays + 1);
     }
 
     void on_exit() override
@@ -183,6 +163,7 @@ public:
             esp_restart();
         }
         if (mode_ == Mode::Chat) {
+            save_chat();   // persist the conversation before we reboot
             // Chat also released BLE for Wi-Fi; reboot to restore it (and to kill
             // the network worker cleanly if it's mid-request).
             esp_restart();
@@ -203,6 +184,24 @@ public:
             }
             return;
         }
+        // Chat list: pick New chat or a saved one with Up/Down, open with A.
+        if (mode_ == Mode::ChatList) {
+            if (ev.kind != ButtonEventKind::Pressed) return;
+            int n = cl_count_ + 1;   // row 0 is "New chat"
+            if (ev.button == Button::Up || ev.button == Button::Down) {
+                cl_highlight(cl_sel_, false);
+                cl_sel_ = (ev.button == Button::Up) ? (cl_sel_ - 1 + n) % n : (cl_sel_ + 1) % n;
+                cl_highlight(cl_sel_, true);
+                return;
+            }
+            if (ev.button == Button::A) {
+                if (cl_sel_ == 0) enter_chat(root_, -1);                 // new
+                else              enter_chat(root_, cl_ids_[cl_sel_ - 1]); // reopen
+                return;
+            }
+            return;   // HOME exits the app via the registry
+        }
+
         // Chat. Scrolling is always allowed; option/new-chat buttons only fire when
         // the turn has fully finished (no worker task running), so A can never spawn
         // a second colliding network task. HOME exits via the registry -> on_exit.
@@ -246,7 +245,7 @@ public:
         wake();
 
         switch (ev.button) {
-            case Button::A:     set_mood(Mood::Happy, 40); enter_chat(root_); return;
+            case Button::A:     set_mood(Mood::Happy, 40); enter_chat_list(root_); return;
             case Button::B:     set_mood(Mood::Thinking, 110); break;
             case Button::Left:  glance(-7.f,  1.f);            break;
             case Button::Right: glance( 7.f,  1.f);            break;
@@ -266,57 +265,29 @@ public:
 
         if (mode_ == Mode::Setup) { tick_setup(); return; }
         if (mode_ == Mode::Chat)  { tick_chat();  return; }
+        if (mode_ == Mode::ChatList) return;   // static list, nothing to animate
 
-        // Hold Start ~2 s to wipe Wi-Fi + key and drop back into setup.
+        // HOME. Hold Start ~2 s to wipe Wi-Fi + key and drop back into setup.
         if (start_hold_ > 0) {
             start_hold_++;
-            if (start_hold_ == 30 && mood_label_) lv_label_set_text(mood_label_, "hold to reset...");
+            if (start_hold_ == 30 && home_hint_) lv_label_set_text(home_hint_, "hold to reset...");
             if (start_hold_ >= 110) { familiar_cfg_reset(); esp_restart(); }
         }
 
-        if (gesture_poll_shake() || gesture_poll_tap()) {
-            wake();
-            set_mood(Mood::Surprised, 55);
-        }
-
-        // Tilt gives the eyes a resting gaze direction when nothing else is set.
+        // Tilt stretches the logo rays (signs tuned so it leans the way you tip it).
         AccelSample s = gesture_last_sample();
-        // Gaze follows the tilt so the eyes look "downhill" toward the screen's
-        // low edge (signs verified on hardware - the creature now looks the way
-        // you tip it, not away from it).
-        float tilt_x = clampf(-s.x_mg * 0.012f, -5.f, 5.f);
-        float tilt_y = clampf(s.y_mg * 0.012f, -4.f, 4.f);
+        float tilt_x = clampf(-s.x_mg * 0.010f, -6.f, 6.f);
+        float tilt_y = clampf( s.y_mg * 0.010f, -6.f, 6.f);
+        look_x_ += (tilt_x - look_x_) * 0.12f;
+        look_y_ += (tilt_y - look_y_) * 0.12f;
 
-        // Idle / sleep bookkeeping.
-        idle_ticks_++;
-        if (mood_ == Mood::Idle && idle_ticks_ > kSleepAfterTicks) {
-            mood_ = Mood::Sleeping;
-            sync_mood_label();
+        render_home();
+
+        // Coral breathing on the LEDs.
+        if ((frame_ & 1) == 0) {
+            float k = 0.25f + 0.25f * (0.5f + 0.5f * sinf(frame_ * 0.06f));
+            set_all(0xD9, 0x77, 0x57, k);
         }
-        if (mood_ticks_ > 0 && --mood_ticks_ == 0 && is_transient(mood_)) {
-            mood_ = Mood::Idle;
-            sync_mood_label();
-        }
-
-        // Ease the gaze toward its target, then let the target relax to tilt.
-        if (mood_ == Mood::Thinking) { look_tx_ = -2.f; look_ty_ = -5.f; }
-        look_x_ += (look_tx_ - look_x_) * 0.18f;
-        look_y_ += (look_ty_ - look_y_) * 0.18f;
-        look_tx_ += (tilt_x - look_tx_) * 0.05f;
-        look_ty_ += (tilt_y - look_ty_) * 0.05f;
-
-        // Blinking (never while napping - the eyes are already shut).
-        if (mood_ != Mood::Sleeping) {
-            if (blink_ > 0) {
-                blink_--;
-            } else if (--next_blink_ <= 0) {
-                blink_ = 7;
-                next_blink_ = 90 + (int)(esp_random() % 160);
-            }
-        }
-
-        render();
-        if ((frame_ & 1) == 0) render_leds();
     }
 
 private:
@@ -547,15 +518,174 @@ private:
 
     void pick_option(int i)
     {
-        hist_add(true, opt_[i]);
-        send_turn();
+        submit_user(opt_[i]);
     }
 
     void new_conversation()
     {
+        save_chat();                 // keep the one we were in
+        cur_chat_id_ = next_chat_id();
         hist_n_ = 0;
-        hist_add(true, "Let us start fresh. Say hi and suggest what we could do!");
-        send_turn();
+        if (chat_scroll_) lv_obj_clean(chat_scroll_);   // wipe the transcript
+        msg_count_ = 0;
+        streaming_bubble_ = nullptr;
+        opt_n_ = 0;
+        for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_label_set_text(opt_lbl_[i], "");
+        if (chat_status_) lv_label_set_text(chat_status_, "Ask anything");
+        chat_done_ = true;
+        chat_processed_ = true;
+    }
+
+    // ---- saved conversations on flash ------------------------------------
+    void chat_path(int id, char *out, int cap) { snprintf(out, cap, "%s/%d.txt", kChatsDir, id); }
+
+    int next_chat_id()
+    {
+        int mx = 0;
+        DIR *d = opendir(kChatsDir);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != nullptr) { int id = atoi(e->d_name); if (id > mx) mx = id; }
+            closedir(d);
+        }
+        return mx + 1;
+    }
+
+    // Persist the current bounded history (last few messages) to this chat's file.
+    void save_chat()
+    {
+        if (cur_chat_id_ < 0 || hist_n_ < 2) return;   // nothing worth saving
+        hal_fs_mkdir_p(kChatsDir);
+        char path[64]; chat_path(cur_chat_id_, path, sizeof(path));
+        FILE *f = fopen(path, "w");
+        if (!f) return;
+        for (int i = 0; i < hist_n_; i++) {
+            fputc(hist_[i].user ? 'u' : 'a', f);
+            for (const char *p = hist_[i].text; *p; p++)
+                fputc((*p == '\n' || *p == '\r') ? ' ' : *p, f);   // one line per message
+            fputc('\n', f);
+        }
+        fclose(f);
+    }
+
+    void load_chat(int id)
+    {
+        hist_n_ = 0;
+        cur_chat_id_ = id;
+        char path[64]; chat_path(id, path, sizeof(path));
+        FILE *f = fopen(path, "r");
+        if (!f) return;
+        char line[kMsgMax + 8];
+        while (fgets(line, sizeof(line), f)) {
+            int L = (int)strlen(line);
+            while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = '\0';
+            if (L < 1) continue;
+            hist_add(line[0] == 'u', line + 1);
+        }
+        fclose(f);
+    }
+
+    // The user's first question makes the most recognizable list title.
+    void chat_title(int id, char *out, int cap)
+    {
+        out[0] = '\0';
+        char path[64]; chat_path(id, path, sizeof(path));
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[kMsgMax + 8];
+            while (fgets(line, sizeof(line), f)) {
+                if (line[0] == 'u') {
+                    strlcpy(out, line + 1, cap);
+                    int L = (int)strlen(out);
+                    while (L > 0 && (out[L - 1] == '\n' || out[L - 1] == '\r')) out[--L] = '\0';
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (!out[0]) snprintf(out, cap, "chat %d", id);
+    }
+
+    void scan_chats()
+    {
+        cl_count_ = 0;
+        DIR *d = opendir(kChatsDir);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != nullptr && cl_count_ < kMaxSaved) {
+                int id = atoi(e->d_name);
+                if (id > 0) cl_ids_[cl_count_++] = id;
+            }
+            closedir(d);
+        }
+        for (int i = 1; i < cl_count_; i++) {   // newest (highest id) first
+            int v = cl_ids_[i], j = i - 1;
+            while (j >= 0 && cl_ids_[j] < v) { cl_ids_[j + 1] = cl_ids_[j]; j--; }
+            cl_ids_[j + 1] = v;
+        }
+    }
+
+    // ---- the chat-list screen --------------------------------------------
+    lv_obj_t *make_cl_row(lv_obj_t *root, const char *txt, int y)
+    {
+        lv_obj_t *r = lv_label_create(root);
+        lv_label_set_text(r, txt);
+        lv_obj_set_style_text_font(r, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(r, lv_color_hex(Cl::TEXT), 0);
+        lv_label_set_long_mode(r, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(r, 300);
+        lv_obj_set_style_bg_color(r, lv_color_hex(Cl::USERBUB), 0);
+        lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_radius(r, 4, 0);
+        lv_obj_set_style_pad_left(r, 6, 0);
+        lv_obj_set_style_pad_ver(r, 2, 0);
+        lv_obj_align(r, LV_ALIGN_TOP_LEFT, 8, y);
+        return r;
+    }
+
+    void cl_highlight(int idx, bool on)
+    {
+        if (idx < 0 || idx > kMaxSaved || !cl_rows_[idx]) return;
+        lv_obj_set_style_bg_opa(cl_rows_[idx], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_color(cl_rows_[idx], lv_color_hex(on ? Cl::CORAL : Cl::USERBUB), 0);
+        lv_obj_set_style_text_color(cl_rows_[idx], lv_color_hex(on ? Cl::SELTEXT : Cl::TEXT), 0);
+    }
+
+    void enter_chat_list(lv_obj_t *root)
+    {
+        lv_obj_clean(root);
+        title_ = mood_label_ = hint_ = zzz_ = nullptr;
+        shadow_ = antenna_ = tip_ = body_ = nullptr;
+        eye_l_ = eye_r_ = pupil_l_ = pupil_r_ = mouth_ = cheek_l_ = cheek_r_ = nullptr;
+        for (int i = 0; i <= kMaxSaved; i++) cl_rows_[i] = nullptr;
+        hal_lights_clear(); hal_lights_show();
+        mode_ = Mode::ChatList;
+        lv_obj_set_style_bg_color(root, lv_color_hex(Cl::BG), 0);
+        lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+
+        scan_chats();
+        cl_sel_ = 0;
+
+        lv_obj_t *title = lv_label_create(root);
+        lv_label_set_text(title, "Your chats");
+        lv_obj_set_style_text_color(title, lv_color_hex(Cl::CORAL), 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+        const int y0 = 36;
+        cl_rows_[0] = make_cl_row(root, "+  New chat", y0);
+        for (int i = 0; i < cl_count_; i++) {
+            char t[48]; chat_title(cl_ids_[i], t, sizeof(t));
+            cl_rows_[i + 1] = make_cl_row(root, t, y0 + (i + 1) * 20);
+        }
+
+        lv_obj_t *hint = lv_label_create(root);
+        lv_label_set_text(hint, "up/dn pick   A open   HOME exit");
+        lv_obj_set_style_text_color(hint, lv_color_hex(Cl::MUTED), 0);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+        cl_highlight(0, true);
     }
 
     // Parse the finished reply: split off the OPTS line into the three follow-up
@@ -563,13 +693,22 @@ private:
     void process_reply()
     {
         const char *opts = strstr(chat_reply_buf_, "OPTS:");
-        int n = opts ? (int)(opts - chat_reply_buf_) : (int)strlen(chat_reply_buf_);
+        int full_n = opts ? (int)(opts - chat_reply_buf_) : (int)strlen(chat_reply_buf_);
+        while (full_n > 0 && (chat_reply_buf_[full_n - 1] == '\n' || chat_reply_buf_[full_n - 1] == ' '
+                              || chat_reply_buf_[full_n - 1] == '\r')) full_n--;
+
+        // The bubble shows the WHOLE reply (never truncated). Only the copy kept as
+        // conversation CONTEXT is capped at kMsgMax to keep the request body small.
+        if (streaming_bubble_) {
+            static char full[2048];
+            int fn = full_n; if (fn > (int)sizeof(full) - 1) fn = sizeof(full) - 1;
+            memcpy(full, chat_reply_buf_, fn); full[fn] = '\0';
+            lv_label_set_text(streaming_bubble_, full[0] ? full : "(no reply)");
+            streaming_bubble_ = nullptr;
+        }
         char clean[kMsgMax];
-        if (n > kMsgMax - 1) n = kMsgMax - 1;
-        memcpy(clean, chat_reply_buf_, n);
-        clean[n] = '\0';
-        while (n > 0 && (clean[n - 1] == '\n' || clean[n - 1] == ' ' || clean[n - 1] == '\r'))
-            clean[--n] = '\0';
+        int cn = full_n; if (cn > kMsgMax - 1) cn = kMsgMax - 1;
+        memcpy(clean, chat_reply_buf_, cn); clean[cn] = '\0';
         if (clean[0]) hist_add(false, clean);
 
         opt_n_ = 0;
@@ -597,6 +736,7 @@ private:
             else            lv_label_set_text(opt_lbl_[i], "");
         }
         if (opt_n_ == 0 && opt_lbl_[0]) lv_label_set_text(opt_lbl_[0], "START  new chat");
+        save_chat();   // persist after every reply, not just on exit
     }
 
     // ---- on-screen keyboard ----------------------------------------------
@@ -605,10 +745,10 @@ private:
         lv_obj_t *k = lv_label_create(root_);
         lv_label_set_text(k, txt);
         lv_obj_set_style_text_font(k, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(k, lv_color_hex(BadgeTheme::TEXT), 0);
+        lv_obj_set_style_text_color(k, lv_color_hex(Cl::TEXT), 0);
         lv_obj_set_style_text_align(k, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_bg_color(k, lv_color_hex(0x2a2030), 0);
-        lv_obj_set_style_bg_opa(k, LV_OPA_50, 0);
+        lv_obj_set_style_bg_color(k, lv_color_hex(Cl::USERBUB), 0);
+        lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(k, 4, 0);
         lv_obj_set_style_pad_top(k, 3, 0);
         lv_obj_set_size(k, w, h);
@@ -620,15 +760,9 @@ private:
     {
         lv_obj_t *k = kb_keys_[r][c];
         if (!k) return;
-        if (on) {
-            lv_obj_set_style_bg_color(k, lv_color_hex(BadgeTheme::ACCENT), 0);
-            lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
-            lv_obj_set_style_text_color(k, lv_color_hex(0x160a16), 0);
-        } else {
-            lv_obj_set_style_bg_color(k, lv_color_hex(0x2a2030), 0);
-            lv_obj_set_style_bg_opa(k, LV_OPA_50, 0);
-            lv_obj_set_style_text_color(k, lv_color_hex(BadgeTheme::TEXT), 0);
-        }
+        lv_obj_set_style_bg_color(k, lv_color_hex(on ? Cl::CORAL : Cl::USERBUB), 0);
+        lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(k, lv_color_hex(on ? Cl::SELTEXT : Cl::TEXT), 0);
     }
 
     void kb_update_line()
@@ -648,7 +782,7 @@ private:
         for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_obj_add_flag(opt_lbl_[i], LV_OBJ_FLAG_HIDDEN);
 
         kb_textline_ = lv_label_create(root_);
-        lv_obj_set_style_text_color(kb_textline_, lv_color_hex(BadgeTheme::TEXT), 0);
+        lv_obj_set_style_text_color(kb_textline_, lv_color_hex(Cl::TEXT), 0);
         lv_obj_set_style_text_font(kb_textline_, &lv_font_montserrat_16, 0);
         lv_label_set_long_mode(kb_textline_, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(kb_textline_, 304);
@@ -672,7 +806,7 @@ private:
 
         kb_hint_ = lv_label_create(root_);
         lv_label_set_text(kb_hint_, "move   A type   B back   START send");
-        lv_obj_set_style_text_color(kb_hint_, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
+        lv_obj_set_style_text_color(kb_hint_, lv_color_hex(Cl::MUTED), 0);
         lv_obj_set_style_text_font(kb_hint_, &lv_font_montserrat_14, 0);
         lv_obj_align(kb_hint_, LV_ALIGN_BOTTOM_MID, 0, -4);
 
@@ -694,8 +828,7 @@ private:
         if (chat_scroll_) lv_obj_clear_flag(chat_scroll_, LV_OBJ_FLAG_HIDDEN);
 
         if (send && kb_len_ > 0) {   // empty + Start = cancel
-            hist_add(true, kb_text_);
-            send_turn();
+            submit_user(kb_text_);
         }
     }
 
@@ -729,7 +862,7 @@ private:
         if (kb_len_ > 0) { kb_text_[--kb_len_] = '\0'; kb_update_line(); }
     }
 
-    void enter_chat(lv_obj_t *root)
+    void enter_chat(lv_obj_t *root, int load_id = -1)
     {
         // Leave the creature behind: clear its widgets and null the handles so
         // the (now-disabled) creature render path can't touch freed objects.
@@ -742,92 +875,141 @@ private:
         mode_ = Mode::Chat;
         if (!chat_mu_) chat_mu_ = xSemaphoreCreateMutex();
 
-        lv_obj_t *title = lv_label_create(root);
-        lv_label_set_text(title, "FAMILIAR");
-        lv_obj_set_style_text_color(title, lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+        lv_obj_set_style_bg_color(root, lv_color_hex(Cl::BG), 0);
+        lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+
+        lv_obj_t *brand = lv_label_create(root);
+        lv_label_set_text(brand, "Claude");
+        lv_obj_set_style_text_color(brand, lv_color_hex(Cl::CORAL), 0);
+        lv_obj_set_style_text_font(brand, &lv_font_montserrat_16, 0);
+        lv_obj_align(brand, LV_ALIGN_TOP_LEFT, 10, 6);
 
         chat_status_ = lv_label_create(root);
-        lv_obj_set_style_text_color(chat_status_, lv_color_hex(BadgeTheme::TEXT_MUTED), 0);
+        lv_obj_set_style_text_color(chat_status_, lv_color_hex(Cl::MUTED), 0);
         lv_obj_set_style_text_font(chat_status_, &lv_font_montserrat_14, 0);
-        lv_obj_align(chat_status_, LV_ALIGN_TOP_MID, 0, 26);
+        lv_obj_align(chat_status_, LV_ALIGN_TOP_RIGHT, -8, 8);
+        lv_label_set_text(chat_status_, "");
 
-        // Scrollable transcript area: the reply label wraps inside and grows; the
-        // container scrolls so long replies stay readable (Up/Down to move).
+        // The transcript: a vertical flex-column scroll of message bubbles. Every
+        // message gets its own bubble, so scrolling shows the whole conversation.
         chat_scroll_ = lv_obj_create(root);
-        lv_obj_set_size(chat_scroll_, 312, 106);
-        lv_obj_align(chat_scroll_, LV_ALIGN_TOP_MID, 0, 46);
+        lv_obj_set_size(chat_scroll_, 316, 150);
+        lv_obj_align(chat_scroll_, LV_ALIGN_TOP_MID, 0, 28);
         lv_obj_set_style_bg_opa(chat_scroll_, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(chat_scroll_, 0, 0);
         lv_obj_set_style_pad_all(chat_scroll_, 2, 0);
+        lv_obj_set_style_pad_row(chat_scroll_, 6, 0);
+        lv_obj_set_flex_flow(chat_scroll_, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_scroll_dir(chat_scroll_, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(chat_scroll_, LV_SCROLLBAR_MODE_AUTO);
+        chat_reply_ = nullptr;
+        streaming_bubble_ = nullptr;
+        msg_count_ = 0;
 
-        chat_reply_ = lv_label_create(chat_scroll_);
-        lv_obj_set_style_text_color(chat_reply_, lv_color_hex(BadgeTheme::TEXT), 0);
-        lv_obj_set_style_text_font(chat_reply_, &lv_font_montserrat_16, 0);
-        lv_label_set_long_mode(chat_reply_, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(chat_reply_, 296);
-        lv_obj_set_pos(chat_reply_, 0, 0);
-        lv_label_set_text(chat_reply_, "");
-
-        // Three follow-up slots, mapped to A / B / Left.
+        // Follow-up chips, mapped to A / B / LEFT.
         for (int i = 0; i < 3; i++) {
             opt_lbl_[i] = lv_label_create(root);
-            lv_obj_set_style_text_color(opt_lbl_[i], lv_color_hex(BadgeTheme::ACCENT_DETAIL), 0);
+            lv_obj_set_style_text_color(opt_lbl_[i], lv_color_hex(Cl::CORAL), 0);
             lv_obj_set_style_text_font(opt_lbl_[i], &lv_font_montserrat_14, 0);
             lv_label_set_long_mode(opt_lbl_[i], LV_LABEL_LONG_DOT);
             lv_obj_set_width(opt_lbl_[i], 300);
-            lv_obj_align(opt_lbl_[i], LV_ALIGN_TOP_LEFT, 10, 158 + i * 18);
+            lv_obj_align(opt_lbl_[i], LV_ALIGN_BOTTOM_LEFT, 10, -44 + i * 16);
             lv_label_set_text(opt_lbl_[i], "");
         }
 
         lv_obj_t *hint = lv_label_create(root);
-        lv_label_set_text(hint, "A/B/LEFT pick   RIGHT type   HOME exit");
-        lv_obj_set_style_text_color(hint, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
+        lv_label_set_text(hint, "A/B/LEFT reply   RIGHT type   HOME exit");
+        lv_obj_set_style_text_color(hint, lv_color_hex(Cl::MUTED), 0);
         lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-        // Fresh conversation: seed a first user turn that nudges a warm greeting.
         familiar_net_log_reset();
-        familiar_net_log("enter_chat");
+        familiar_net_log("enter_chat load=%d", load_id);
         // Create the persistent network worker NOW, while the heap still has a big
         // contiguous block (Wi-Fi has not fragmented it yet). One 12KB stack for the
         // whole session, reused every turn.
         if (!chat_worker_)
             xTaskCreate(&FamiliarApp::chat_worker_fn, "fam_chat", 12288, this, 5, &chat_worker_);
-        hist_n_ = 0;
-        hist_add(true, "I just opened you on my badge. Say hi and suggest what we could do!");
+
+        if (load_id >= 0) {
+            // Reopen a saved chat: rebuild the transcript. Idle (no auto-turn) -
+            // the owner continues by typing (Right).
+            load_chat(load_id);
+            for (int i = 0; i < hist_n_; i++) add_bubble(hist_[i].user, hist_[i].text);
+            lv_label_set_text(chat_status_, "RIGHT to type");
+            if (chat_scroll_) lv_obj_scroll_to_y(chat_scroll_, LV_COORD_MAX, LV_ANIM_OFF);
+        } else {
+            // Brand new empty chat. Normal Claude: no auto-greeting, the user asks.
+            cur_chat_id_ = next_chat_id();
+            hist_n_ = 0;
+            lv_label_set_text(chat_status_, "Ask anything");
+        }
+        chat_done_ = true;
+        chat_processed_ = true;
+        opt_n_ = 0;
+    }
+
+    // Add one message bubble to the transcript. User bubbles sit right in a filled
+    // pill; Claude replies are plain cream text on the left, like the Claude app.
+    lv_obj_t *add_bubble(bool user, const char *text)
+    {
+        if (!chat_scroll_) return nullptr;
+        lv_obj_t *b = lv_label_create(chat_scroll_);
+        lv_label_set_long_mode(b, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(b, user ? 224 : 300);
+        lv_obj_set_style_text_font(b, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(b, lv_color_hex(Cl::TEXT), 0);
+        if (user) {
+            lv_obj_set_style_bg_color(b, lv_color_hex(Cl::USERBUB), 0);
+            lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(b, 12, 0);
+            lv_obj_set_style_pad_all(b, 7, 0);
+            lv_obj_set_style_margin_left(b, 64, 0);   // push the pill to the right
+        } else {
+            lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(b, 2, 0);
+        }
+        lv_label_set_text(b, text);
+        if (++msg_count_ > 16) {   // bound memory: drop the oldest bubble
+            lv_obj_t *first = lv_obj_get_child(chat_scroll_, 0);
+            if (first) { lv_obj_del(first); msg_count_--; }
+        }
+        return b;
+    }
+
+    // Send a user message: show its bubble, record it, open an empty Claude bubble
+    // to stream into, and wake the worker.
+    void submit_user(const char *text)
+    {
+        if (!text || !text[0]) return;
+        add_bubble(true, text);
+        hist_add(true, text);
+        streaming_bubble_ = add_bubble(false, "...");
         send_turn();
     }
 
     void tick_chat()
     {
-        if (chat_dirty_ && chat_status_) {
+        if (chat_dirty_) {
             xSemaphoreTake(chat_mu_, portMAX_DELAY);
-            lv_label_set_text(chat_status_, chat_status_buf_);
-            if (chat_reply_) {
-                // Hide the trailing OPTS line while streaming: show only the text
-                // before it. The options become buttons once the turn finishes.
+            if (chat_status_) lv_label_set_text(chat_status_, chat_status_buf_);
+            if (streaming_bubble_) {
+                // Show the reply so far minus the trailing OPTS line (which becomes
+                // the follow-up chips once the turn finishes).
                 const char *opts = strstr(chat_reply_buf_, "OPTS:");
-                if (opts) {
-                    static char disp[1024];
-                    int n = (int)(opts - chat_reply_buf_);
-                    if (n > (int)sizeof(disp) - 1) n = sizeof(disp) - 1;
-                    memcpy(disp, chat_reply_buf_, n);
-                    while (n > 0 && (disp[n - 1] == '\n' || disp[n - 1] == ' ' || disp[n - 1] == '\r')) n--;
-                    disp[n] = '\0';
-                    lv_label_set_text(chat_reply_, disp);
-                } else {
-                    lv_label_set_text(chat_reply_, chat_reply_buf_);
-                }
+                static char disp[2048];
+                int n = opts ? (int)(opts - chat_reply_buf_) : (int)strlen(chat_reply_buf_);
+                if (n > (int)sizeof(disp) - 1) n = sizeof(disp) - 1;
+                memcpy(disp, chat_reply_buf_, n);
+                while (n > 0 && (disp[n - 1] == '\n' || disp[n - 1] == ' ' || disp[n - 1] == '\r')) n--;
+                disp[n] = '\0';
+                lv_label_set_text(streaming_bubble_, disp[0] ? disp : "...");
             }
             chat_dirty_ = false;
             xSemaphoreGive(chat_mu_);
             if (chat_scroll_) lv_obj_scroll_to_y(chat_scroll_, LV_COORD_MAX, LV_ANIM_OFF);
         }
-        // Turn finished: parse the OPTS line into buttons + commit to history once.
+        // Turn finished: parse the OPTS line into chips + commit to history once.
         if (chat_done_ && !chat_processed_) {
             process_reply();
             chat_processed_ = true;
@@ -1028,7 +1210,7 @@ private:
     static constexpr int kEye = 28;
     static constexpr int kPupil = 12;
 
-    enum class Mode : uint8_t { Creature, Setup, Chat };
+    enum class Mode : uint8_t { Creature, Setup, Chat, ChatList };
     Mode mode_ = Mode::Creature;
     lv_obj_t *root_ = nullptr;
     int start_hold_ = 0;   // frames Start has been held (creature reset gesture)
@@ -1039,9 +1221,15 @@ private:
     // buffers (guarded by chat_mu_); tick_chat() renders them on the UI task.
     lv_obj_t *chat_status_ = nullptr, *chat_reply_ = nullptr, *chat_scroll_ = nullptr;
     lv_obj_t *opt_lbl_[3] = {nullptr, nullptr, nullptr};
+    // Claude-style transcript: one label per message in a flex-column scroll.
+    lv_obj_t *streaming_bubble_ = nullptr;   // the Claude bubble being streamed into
+    int msg_count_ = 0;
+    // Home screen: the Claude sunburst logo drawn as one polyline through centre.
+    lv_obj_t *logo_line_ = nullptr, *home_name_ = nullptr, *home_hint_ = nullptr;
+    lv_point_precise_t logo_pts_[26];
     SemaphoreHandle_t chat_mu_ = nullptr;
     TaskHandle_t chat_worker_ = nullptr;   // one persistent turn-runner per session
-    char chat_reply_buf_[1024] = {0};
+    char chat_reply_buf_[2048] = {0};
     int  chat_reply_len_ = 0;
     char chat_status_buf_[80] = {0};
     volatile bool chat_dirty_ = false, chat_done_ = false;
@@ -1070,15 +1258,29 @@ private:
     lv_obj_t *kb_keys_[5][10] = {{nullptr}};
     lv_obj_t *kb_textline_ = nullptr, *kb_hint_ = nullptr;
 
+    // Saved conversations on flash: /littlefs/fchats/<id>.txt, one line per message
+    // prefixed 'u' or 'a'. cur_chat_id_ is the file the current chat writes on exit;
+    // the ChatList screen lists them newest-first for reopening.
+    static constexpr const char *kChatsDir = "/littlefs/fchats";
+    static constexpr int kMaxSaved = 10;
+    int cur_chat_id_ = -1;
+    int cl_ids_[kMaxSaved] = {0};
+    int cl_count_ = 0;
+    int cl_sel_ = 0;
+    lv_obj_t *cl_rows_[kMaxSaved + 1] = {nullptr};
+
     // System prompt: keep it free of double quotes and backslashes so it embeds in
     // the JSON body with no escaping. Claude ends each reply with an OPTS line we
     // parse into the three button-mapped follow-ups.
+    // Normal Claude. No persona, no identity, no mention of a badge - just a
+    // concise assistant. The only added instruction is the OPTS line that powers
+    // the tap-to-reply buttons; it is a format requirement, not a personality.
     static constexpr const char *kSysPrompt =
-        "You are Familiar, a tiny AI companion living on a 12 dollar hacker badge built at Hack the "
-        "North. Keep every reply warm, playful and SHORT: 1 to 3 small sentences, this is a tiny "
-        "screen. After your reply, always add one final line in exactly this format: "
-        "OPTS: first | second | third  where each is a short thing the owner might tap to say next "
-        "(max 5 words each). Never use quotation marks or backslashes anywhere in your response.";
+        "Answer normally and concisely. Keep replies reasonably short. If a question "
+        "needs current facts, use web search before answering rather than guessing. "
+        "After your reply, add one final line in exactly this format: "
+        "OPTS: first | second | third  where each is a short follow-up the user might "
+        "tap to say next (max 5 words each). Do not use quotation marks or backslashes.";
 
     Mood mood_ = Mood::Idle;
     int mood_ticks_ = 0;

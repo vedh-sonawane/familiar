@@ -576,11 +576,13 @@ int familiar_net_claude_stream_msgs(const char *system_prompt,
     }
     familiar_cfg_get(FAMILIAR_K_MODEL_CHAT, model, sizeof(model), FAMILIAR_DEFAULT_MODEL_CHAT);
 
-    // Body holds the system prompt + the whole (bounded) conversation. The caller
-    // caps history so this stays well under the buffer.
+    // Body holds the system prompt + the whole (bounded) conversation, plus the
+    // server-side web_search tool so Claude can look up current facts instead of
+    // hallucinating. The caller caps history so this stays under the buffer.
     static char body[2560];
     int blen = snprintf(body, sizeof(body),
-        "{\"model\":\"%s\",\"max_tokens\":200,\"stream\":true,"
+        "{\"model\":\"%s\",\"max_tokens\":350,\"stream\":true,"
+        "\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3}],"
         "\"system\":\"%s\",\"messages\":%s}",
         model, system_prompt ? system_prompt : "", messages_json);
     if (blen <= 0 || blen >= (int)sizeof(body)) {
