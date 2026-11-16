@@ -264,3 +264,23 @@ Familiar is a platform, not a chatbot. On top of Chat/Hands/Forge/Senses/Memory/
   max_tokens at 200, and LVGL 48 -> 44 KB. Verified on badge: 4 turns, cert validated every turn,
   heap steady at ~27 KB free after each turn, no leak. **Next in Phase 2: D-pad keyboard** to type
   your own prompt (not just the suggestions), then saved conversations on flash.
+- **2026-11-14 - PHASE 2 (part 2) DONE: D-pad keyboard + runs fully STANDALONE (off a computer).**
+  Added an on-screen keyboard (Right opens it; D-pad moves the key, A types, B deletes, Start sends)
+  so you can type any prompt. The hard part was making chat work on battery / a wall charger, not
+  just tethered to a PC. Root causes found with an on-flash black-box recorder (familiar_net_log ->
+  /littlefs/famlog.txt, read back with `cat`), since serial is unavailable off-computer:
+    1. esp_http_client returns ESP_ERR_HTTP_CONNECT (0x7002) off-computer though raw esp-tls to the
+       same host works. FIX: dropped esp_http_client; send the HTTP/1.1 request by hand over esp-tls
+       (connection: close; feed the body straight to the SSE parser, which ignores chunk-size lines).
+    2. USB-Serial-JTAG console write blocks forever with no host draining it, hanging the net task.
+       FIX: esp_log_set_vprintf hook that drops log lines when usb_serial_jtag_is_connected() is
+       false. (An earlier O_NONBLOCK-on-stdout hack ALSO broke stdin -> REPL spun printing "badge> "
+       millions of times, starving tasks - reverted.)
+    3. THE follow-up bug: a fresh 12 KB worker task was spawned PER TURN; once Wi-Fi fragments the
+       heap the 12 KB contiguous stack could not be allocated (worked tethered by luck). FIX: ONE
+       persistent worker created in enter_chat (before Wi-Fi), woken per turn via task notification.
+  Supporting: SNTP now retries 4x8s (single "clock sync failed" was a lost UDP query); TX power 72
+  -> 52 (lower current for weak batteries); APB_FREQ_MAX pm-lock held for the session; self-heal
+  reconnect if a turn's link is stale. Verified: full multi-turn conversation on a wall charger with
+  no computer attached. **Next in Phase 2: saved conversations on flash** (reopen past chats). Then
+  Phase 3 (Hands: tools, LEDs, pixel art, timers, notes, idle creature).

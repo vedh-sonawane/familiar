@@ -15,6 +15,7 @@
 #include "esp_tls.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
+#include "esp_pm.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
@@ -27,8 +28,27 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
 
 static const char *TAG = "fam_net";
+
+void familiar_net_log_reset(void)
+{
+    FILE *f = fopen("/littlefs/famlog.txt", "w");
+    if (f) fclose(f);
+}
+
+void familiar_net_log(const char *fmt, ...)
+{
+    FILE *f = fopen("/littlefs/famlog.txt", "a");
+    if (!f) return;
+    fprintf(f, "%u ", (unsigned)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 // Internal-RAM free size and largest contiguous block - the pair that matters on
 // a no-PSRAM part, since a TLS handshake needs one big contiguous buffer, not
@@ -38,8 +58,6 @@ static void log_heap(const char *stage)
     unsigned freeb = (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     unsigned largest = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     ESP_LOGI(TAG, "heap %-16s free=%u largest=%u", stage, freeb, largest);
-    // Also print without the log prefix so the serial reader can scrape it plainly.
-    printf("fam_net %-16s free=%u largest=%u\n", stage, freeb, largest);
 }
 
 void familiar_net_probe(void)
@@ -93,6 +111,7 @@ int familiar_wifiprobe_cmd(int /*argc*/, char ** /*argv*/)
 
 // ======================= STA connect + Anthropic client ======================
 
+static esp_pm_lock_handle_t s_pm_lock = nullptr;   // keeps APB at 80 MHz during a session
 static EventGroupHandle_t s_wifi_eg = nullptr;
 static esp_netif_t       *s_sta_netif = nullptr;
 static esp_event_handler_instance_t s_sta_any = nullptr, s_sta_got_ip = nullptr;
@@ -140,6 +159,17 @@ bool familiar_net_sta_connect(int timeout_ms, char *out_err, int out_err_sz)
     }
     familiar_cfg_get(FAMILIAR_K_PASS, pass, sizeof(pass), "");
 
+    // Keep the APB bus clock at 80 MHz for the whole session. A plugged-in computer
+    // holds this lock through the USB-Serial-JTAG peripheral; without it, once the
+    // badge goes idle between chat turns the clock scales down and the Wi-Fi link
+    // goes stale, so follow-up turns could not reconnect (worked tethered, hung on
+    // battery/charger). APB (not CPU) is what the radio needs, and it draws less
+    // current than a CPU lock. Held until reboot (Familiar reboots on Wi-Fi exit).
+#if CONFIG_PM_ENABLE
+    if (!s_pm_lock) esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "familiar", &s_pm_lock);
+    if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
+#endif
+
     // Reclaim BLE RAM for Wi-Fi (same trade as setup; reboot restores BLE).
     esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     log_heap("sta before");
@@ -174,11 +204,10 @@ bool familiar_net_sta_connect(int timeout_ms, char *out_err, int out_err_sz)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wc));
     err = esp_wifi_start();
     if (err != ESP_OK) { if (out_err) strlcpy(out_err, "wifi start failed", out_err_sz); return false; }
-    // TX power: 72 = 18 dBm. The old 44 (~11 dBm) cap was for the brownout crash,
-    // but the detector is now disabled and a Familiar session runs on wall/USB
-    // power. A weak uplink was dropping the WPA3-SAE auth frames (reason 2 =
-    // AUTH_EXPIRE); a strong link makes association reliable.
-    esp_wifi_set_max_tx_power(72);
+    // TX power: 52 = 13 dBm. Association is reliable now via the BSSID pin, so the
+    // high 18 dBm setting is not needed, and its bigger current spike browns out
+    // weak AA batteries. 13 dBm still reaches the router fine at the observed RSSI.
+    esp_wifi_set_max_tx_power(52);
     // Disable Wi-Fi power-save. With the default min-modem power save the radio
     // sleeps between beacons and drops the TCP SYN-ACK, so UDP (DNS, SNTP) works
     // but the TCP connect to Anthropic times out (le0x8006). We're on USB/wall
@@ -238,20 +267,28 @@ bool familiar_net_sta_connect(int timeout_ms, char *out_err, int out_err_sz)
                                                pdTRUE, pdFALSE, pdMS_TO_TICKS(13000));
         if (bits & kBitConnected) { connected = true; break; }
         ESP_LOGW(TAG, "wifi attempt %d failed (reason %d); backing off 2.5s", attempt, s_last_reason);
+        familiar_net_log("sta: assoc try %d fail r%d", attempt, s_last_reason);
         vTaskDelay(pdMS_TO_TICKS(2500));
     }
     log_heap("sta after");
+    familiar_net_log("sta: %s", connected ? "associated" : "GAVE UP");
     if (connected) {
         // TLS cert validation checks notBefore/notAfter against the clock, but
         // the chip boots at 1970 - every cert looks "not yet valid" and the
         // handshake is rejected. Sync real time over NTP before any HTTPS call.
         time_t now = 0; time(&now);
-        if (now < 1700000000) {   // still ~1970 -> need a clock
+        if (now < 1700000000) {   // still ~1970 -> need a clock over NTP
+            // Several waits, not one: a single UDP query to the pool is easily
+            // lost, which showed up on screen as "clock sync failed". Up to 4
+            // waits of 8 s each (the SNTP client keeps retransmitting) makes it
+            // robust without needing a bigger server list.
             esp_sntp_config_t sc = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
             if (esp_netif_sntp_init(&sc) == ESP_OK) {
-                esp_err_t se = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
-                time(&now);
-                ESP_LOGI(TAG, "sntp %s, time=%ld", esp_err_to_name(se), (long)now);
+                for (int i = 0; i < 4 && now < 1700000000; i++) {
+                    esp_err_t se = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(8000));
+                    time(&now);
+                    ESP_LOGI(TAG, "sntp try %d: %s, time=%ld", i, esp_err_to_name(se), (long)now);
+                }
                 esp_netif_sntp_deinit();
             }
             if (now < 1700000000 && out_err)
@@ -552,57 +589,121 @@ int familiar_net_claude_stream_msgs(const char *system_prompt,
     }
     log_heap("msg tls before");
 
-    // Lean path: the connection is already proven (first call ran the probes), so
-    // go straight to the HTTPS POST. One fresh TLS session per turn; Wi-Fi stays up.
-    esp_http_client_config_t cfg = {};
-    cfg.url = "https://api.anthropic.com/v1/messages";
-    cfg.method = HTTP_METHOD_POST;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.timeout_ms = 30000;
-    cfg.buffer_size = 2048;
-    cfg.buffer_size_tx = 1536;
-    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-    if (!cl) { if (on_status) on_status("http init failed", ctx); return -2; }
+    // Send the request straight over esp-tls, by hand, instead of esp_http_client.
+    // The http_client wrapper returns ESP_ERR_HTTP_CONNECT (0x7002) whenever the
+    // badge runs off a computer, yet a raw esp-tls connection to the SAME host
+    // succeeds there (proven on-screen by the earlier probe). So we open the TLS
+    // connection ourselves and write a minimal HTTP/1.1 request over it. Retried
+    // twice on a transient connect/read failure - always before any reply byte is
+    // delivered, so a retry can never duplicate text. Kept short (2 x 12 s) so a
+    // dead link fails fast and the caller can reconnect Wi-Fi and try again.
+    familiar_net_log("stream: start blen=%d", blen);
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        familiar_net_log("stream: tls connect try %d", attempt);
+        esp_tls_cfg_t tcfg = {};
+        tcfg.crt_bundle_attach = esp_crt_bundle_attach;
+        tcfg.timeout_ms = 12000;
+        tcfg.addr_family = ESP_TLS_AF_INET;   // IPv4 only (badge has no IPv6 route)
+        esp_tls_t *tls = esp_tls_init();
+        if (!tls) { familiar_net_log("stream: tls_init NULL"); if (on_status) on_status("tls init failed", ctx); return -2; }
 
-    esp_http_client_set_header(cl, "x-api-key", key);
-    esp_http_client_set_header(cl, "anthropic-version", "2023-06-01");
-    esp_http_client_set_header(cl, "content-type", "application/json");
-
-    int rc = 0;
-    esp_err_t err = esp_http_client_open(cl, blen);
-    if (err != ESP_OK) { if (on_status) on_status("couldn't reach Claude", ctx); rc = -3; goto mdone; }
-    if (esp_http_client_write(cl, body, blen) < 0) { if (on_status) on_status("send failed", ctx); rc = -4; goto mdone; }
-
-    {
-        esp_http_client_fetch_headers(cl);
-        int status = esp_http_client_get_status_code(cl);
-        log_heap("msg tls connected");
-        if (status != 200) {
-            char ebuf[256];
-            int en = esp_http_client_read(cl, ebuf, sizeof(ebuf) - 1);
-            if (en < 0) en = 0;
-            ebuf[en] = '\0';
-            const char *m = strstr(ebuf, "\"message\":\"");
-            char reason[80];
-            if (m) decode_json_str(m + 11, reason, sizeof(reason));
-            else   snprintf(reason, sizeof(reason), "HTTP %d", status);
-            ESP_LOGE(TAG, "claude %d: %s", status, ebuf);
-            if (on_status) on_status(reason, ctx);
-            rc = -5; goto mdone;
+        if (esp_tls_conn_new_sync("api.anthropic.com", 17, 443, &tcfg, tls) != 1) {
+            int te = 0, tf = 0; esp_err_t le = ESP_OK; esp_tls_error_handle_t eh = nullptr;
+            if (esp_tls_get_error_handle(tls, &eh) == ESP_OK && eh)
+                le = esp_tls_get_and_clear_last_error(eh, &te, &tf);
+            esp_tls_conn_destroy(tls);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "TLS le0x%x mb0x%x f0x%x", (unsigned)le, (unsigned)(-te), (unsigned)tf);
+            ESP_LOGW(TAG, "tls connect attempt %d: %s", attempt, msg);
+            familiar_net_log("stream: tls FAIL %s", msg);
+            if (attempt < 2) { vTaskDelay(pdMS_TO_TICKS(1200)); continue; }
+            if (on_status) on_status(msg, ctx);
+            log_heap("msg tls after");
+            return -6;
         }
-        if (on_status) on_status("", ctx);
+        familiar_net_log("stream: tls connected");
+        log_heap("msg tls connected");
+
+        // Write the request: headers then the JSON body, looping on partial writes.
+        char hdr[400];
+        int hl = snprintf(hdr, sizeof(hdr),
+            "POST /v1/messages HTTP/1.1\r\n"
+            "Host: api.anthropic.com\r\n"
+            "x-api-key: %s\r\n"
+            "anthropic-version: 2023-06-01\r\n"
+            "content-type: application/json\r\n"
+            "content-length: %d\r\n"
+            "connection: close\r\n\r\n", key, blen);
+        bool wrote = true;
+        for (int pass = 0; pass < 2 && wrote; pass++) {
+            const char *p = (pass == 0) ? hdr : body;
+            int len = (pass == 0) ? hl : blen, off = 0;
+            while (off < len) {
+                int w = esp_tls_conn_write(tls, p + off, len - off);
+                if (w == ESP_TLS_ERR_SSL_WANT_READ || w == ESP_TLS_ERR_SSL_WANT_WRITE) continue;
+                if (w < 0) { wrote = false; break; }
+                off += w;
+            }
+        }
+        if (!wrote) {
+            esp_tls_conn_destroy(tls);
+            ESP_LOGW(TAG, "tls write attempt %d failed", attempt);
+            if (attempt < 2) { vTaskDelay(pdMS_TO_TICKS(1200)); continue; }
+            if (on_status) on_status("send failed", ctx);
+            log_heap("msg tls after");
+            return -4;
+        }
+
+        // Read the response. Skip HTTP headers (up to the blank line) with a rolling
+        // \r\n\r\n match, grab the status code from the first line, then feed the
+        // rest to the SSE parser. feed_sse only reacts to "data:" lines, so any
+        // chunked-transfer size lines pass through harmlessly.
         StreamCtx sc = {}; sc.on_delta = on_delta; sc.ctx = ctx;
+        char hacc[128]; int hlen = 0, hmatch = 0, status_code = 0;
+        bool hdr_done = false;
         char rbuf[1024];
         while (true) {
-            int n = esp_http_client_read(cl, rbuf, sizeof(rbuf));
-            if (n <= 0) break;
-            feed_sse(&sc, rbuf, n);
+            int n = esp_tls_conn_read(tls, rbuf, sizeof(rbuf));
+            if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) continue;
+            if (n <= 0) break;   // 0 = server closed (stream end), <0 = error/timeout
+            int bstart = 0;
+            if (!hdr_done) {
+                int i = 0;
+                for (; i < n; i++) {
+                    char c = rbuf[i];
+                    if (hlen < (int)sizeof(hacc) - 1) hacc[hlen++] = c;
+                    if (c == '\r')      hmatch = (hmatch == 2) ? 3 : 1;
+                    else if (c == '\n') hmatch = (hmatch == 1) ? 2 : (hmatch == 3) ? 4 : 0;
+                    else                hmatch = 0;
+                    if (hmatch == 4) {
+                        hdr_done = true;
+                        hacc[hlen] = '\0';
+                        const char *sp = strchr(hacc, ' ');
+                        if (sp) status_code = atoi(sp + 1);
+                        if (status_code == 200 && on_status) on_status("", ctx);
+                        i++;
+                        break;
+                    }
+                }
+                bstart = i;
+                if (!hdr_done) continue;
+            }
+            if (status_code == 200) feed_sse(&sc, rbuf + bstart, n - bstart);
         }
+        esp_tls_conn_destroy(tls);
+        familiar_net_log("stream: status=%d", status_code);
+        log_heap("msg tls after");
+        if (status_code == 200) { familiar_net_log("stream: done ok"); return 0; }
+        if (status_code > 0) {
+            char msg[48]; snprintf(msg, sizeof(msg), "Claude error HTTP %d", status_code);
+            if (on_status) on_status(msg, ctx);
+            return -5;
+        }
+        ESP_LOGW(TAG, "no response attempt %d", attempt);
+        familiar_net_log("stream: no response");
+        if (attempt < 2) { vTaskDelay(pdMS_TO_TICKS(1200)); continue; }
+        if (on_status) on_status("couldn't reach Claude", ctx);
+        return -3;
     }
-
-mdone:
-    esp_http_client_close(cl);
-    esp_http_client_cleanup(cl);
-    log_heap("msg tls after");
-    return rc;
+    return -3;
 }

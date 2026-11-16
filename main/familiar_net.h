@@ -19,6 +19,12 @@ void familiar_net_probe(void);
 // esp_console command wrapper (registered in hal_console.cpp).
 int familiar_wifiprobe_cmd(int argc, char **argv);
 
+// Black-box recorder: append a line to /littlefs/famlog.txt (printf-style). Lets
+// us capture what happens while the badge runs OFF a computer, then read it back
+// with the console `cat famlog.txt` once plugged in again. _reset truncates it.
+void familiar_net_log(const char *fmt, ...);
+void familiar_net_log_reset(void);
+
 // Connect to the Wi-Fi stored in NVS (STA). Releases the BLE controller's RAM
 // for Wi-Fi first (BLE returns on the next reboot). Returns true once an IP is
 // obtained, false on timeout/failure. `out_err` (optional, >=48 bytes) gets a

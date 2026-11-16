@@ -31,6 +31,7 @@
 #include "esp_lvgl_port.h"
 #include "esp_system.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "driver/usb_serial_jtag.h"
 #include "lvgl.h"
 
 #include <cstdio>
@@ -1088,6 +1089,15 @@ static int cmd_radio(int argc, char **argv)
     return 0;
 }
 
+// ESP_LOG output hook: when a USB host is draining the console, log normally;
+// otherwise drop the line so the write cannot block on a full TX buffer (battery /
+// wall-charger operation). Does not touch stdin, so the REPL is unaffected.
+static int familiar_log_vprintf(const char *fmt, va_list ap)
+{
+    if (!usb_serial_jtag_is_connected()) return 0;
+    return vprintf(fmt, ap);
+}
+
 void hal_console_start()
 {
     esp_console_repl_t *repl = nullptr;
@@ -1145,5 +1155,14 @@ void hal_console_start()
     }
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+    // Route ESP_LOG through a hook that DROPS output when no USB host is draining
+    // the console. Without this, a task that logs (e.g. the Wi-Fi + TLS path) blocks
+    // forever on a full USB-Serial-JTAG TX buffer the instant the badge runs on
+    // battery or a wall charger instead of a computer - that is why Claude only
+    // worked while tethered. This leaves stdin alone, so the REPL keeps blocking on
+    // input (idle) instead of spinning; a connected host still sees every line.
+    esp_log_set_vprintf(&familiar_log_vprintf);
+
     ESP_LOGI(TAG, "console started");
 }

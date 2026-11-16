@@ -208,10 +208,25 @@ public:
         // a second colliding network task. HOME exits via the registry -> on_exit.
         if (mode_ == Mode::Chat) {
             if (ev.kind != ButtonEventKind::Pressed) return;
+            // The keyboard is modal: while open it owns every button.
+            if (kb_open_) {
+                switch (ev.button) {
+                    case Button::Up:    kb_move(-1, 0); break;
+                    case Button::Down:  kb_move( 1, 0); break;
+                    case Button::Left:  kb_move( 0, -1); break;
+                    case Button::Right: kb_move( 0,  1); break;
+                    case Button::A:     kb_type(); break;
+                    case Button::B:     kb_backspace(); break;
+                    case Button::Start: close_keyboard(true); break;   // empty = cancel
+                    default: break;
+                }
+                return;
+            }
             if (ev.button == Button::Up)   { if (chat_scroll_) lv_obj_scroll_by(chat_scroll_, 0,  44, LV_ANIM_ON); return; }
             if (ev.button == Button::Down) { if (chat_scroll_) lv_obj_scroll_by(chat_scroll_, 0, -44, LV_ANIM_ON); return; }
             bool busy = !chat_done_ || !chat_processed_;   // a turn is in flight
             if (busy) return;
+            if (ev.button == Button::Right) { open_keyboard(); return; }   // type your own
             if (ev.button == Button::Start) { new_conversation(); return; }
             int pick = (ev.button == Button::A)    ? 0
                      : (ev.button == Button::B)    ? 1
@@ -416,34 +431,50 @@ private:
         self->chat_dirty_ = true;
         xSemaphoreGive(self->chat_mu_);
     }
-    static void chat_task(void *arg)
+    // ONE persistent worker for the whole chat session, created in enter_chat while
+    // the heap still has a big contiguous block (before Wi-Fi fragments it). It
+    // sleeps on a task notification and runs one turn per notify. This replaces the
+    // old spawn-a-task-per-turn design, whose 12KB stack could not be allocated
+    // once Wi-Fi was up and the heap fragmented - the exact off-computer bug.
+    static void chat_worker_fn(void *arg)
     {
         auto *self = static_cast<FamiliarApp *>(arg);
-        char err[64] = {0};
-        // Connect only if we don't already hold an IP: after the first turn the
-        // Wi-Fi link stays up, so follow-ups skip straight to the request.
-        if (!familiar_net_sta_has_ip()) {
-            chat_status_cb("connecting to Wi-Fi...", self);
-            if (!familiar_net_sta_connect(60000, err, sizeof(err))) {
-                chat_status_cb(err[0] ? err : "Wi-Fi failed", self);
-                self->chat_done_ = true;
-                self->chat_processed_ = true;   // nothing to parse
-                self->chat_task_ = nullptr;
-                vTaskDelete(nullptr);
-                return;
-            }
+        for (;;) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   // wait for the next turn
+            self->run_one_turn();
         }
-        chat_status_cb("Claude is thinking...", self);
-        // On the task stack (12KB), not static RAM: msgs is only needed to build
-        // the request body, and keeping it off the permanent heap leaves more room
-        // for the TLS certificate verification (which needs a ~4.4KB block).
-        char msgs[2048];
-        self->build_messages(msgs, sizeof(msgs));
-        familiar_net_claude_stream_msgs(kSysPrompt, msgs,
-            &FamiliarApp::chat_delta_cb, &FamiliarApp::chat_status_cb, self);
-        self->chat_done_ = true;
-        self->chat_task_ = nullptr;
-        vTaskDelete(nullptr);
+    }
+
+    void run_one_turn()
+    {
+        char err[64] = {0};
+        int r = -1;
+        familiar_net_log("turn: entered");
+        // Two tries: if the request fails because the Wi-Fi link went stale between
+        // turns, tear it down and reconnect from scratch, then retry once.
+        for (int tryc = 0; tryc < 2; tryc++) {
+            familiar_net_log("turn: try %d has_ip=%d", tryc, (int)familiar_net_sta_has_ip());
+            if (!familiar_net_sta_has_ip()) {
+                chat_status_cb(tryc == 0 ? "connecting to Wi-Fi..." : "reconnecting...", this);
+                if (!familiar_net_sta_connect(60000, err, sizeof(err))) {
+                    familiar_net_log("turn: sta_connect FAILED (%s)", err);
+                    chat_status_cb(err[0] ? err : "Wi-Fi failed", this);
+                    chat_done_ = true;
+                    chat_processed_ = true;   // nothing to parse
+                    return;
+                }
+            }
+            chat_status_cb("Claude is thinking...", this);
+            char msgs[2048];
+            build_messages(msgs, sizeof(msgs));
+            r = familiar_net_claude_stream_msgs(kSysPrompt, msgs,
+                &FamiliarApp::chat_delta_cb, &FamiliarApp::chat_status_cb, this);
+            familiar_net_log("turn: stream r=%d", r);
+            if (r == 0 || r == -5) break;   // success, or a real HTTP error (shown): done
+            if (tryc == 0) { familiar_net_log("turn: dropping link to reconnect"); familiar_net_sta_disconnect(); }
+        }
+        familiar_net_log("turn: exiting r=%d", r);
+        chat_done_ = true;
     }
 
     // ---- multi-turn helpers ----------------------------------------------
@@ -502,7 +533,16 @@ private:
         opt_n_ = 0;
         for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_label_set_text(opt_lbl_[i], "");
         if (chat_reply_) lv_label_set_text(chat_reply_, "");
-        xTaskCreate(&FamiliarApp::chat_task, "fam_chat", 12288, this, 5, &chat_task_);
+        // Wake the single persistent worker (created once in enter_chat). No
+        // per-turn task allocation, so a fragmented heap can never block a turn.
+        familiar_net_log("send_turn: notify");
+        if (chat_worker_) {
+            xTaskNotifyGive(chat_worker_);
+        } else {
+            chat_status_cb("worker missing", this);
+            chat_done_ = true;
+            chat_processed_ = true;
+        }
     }
 
     void pick_option(int i)
@@ -557,6 +597,136 @@ private:
             else            lv_label_set_text(opt_lbl_[i], "");
         }
         if (opt_n_ == 0 && opt_lbl_[0]) lv_label_set_text(opt_lbl_[0], "START  new chat");
+    }
+
+    // ---- on-screen keyboard ----------------------------------------------
+    lv_obj_t *make_key(const char *txt, int x, int y, int w, int h)
+    {
+        lv_obj_t *k = lv_label_create(root_);
+        lv_label_set_text(k, txt);
+        lv_obj_set_style_text_font(k, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(k, lv_color_hex(BadgeTheme::TEXT), 0);
+        lv_obj_set_style_text_align(k, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_bg_color(k, lv_color_hex(0x2a2030), 0);
+        lv_obj_set_style_bg_opa(k, LV_OPA_50, 0);
+        lv_obj_set_style_radius(k, 4, 0);
+        lv_obj_set_style_pad_top(k, 3, 0);
+        lv_obj_set_size(k, w, h);
+        lv_obj_set_pos(k, x, y);
+        return k;
+    }
+
+    void kb_highlight(int r, int c, bool on)
+    {
+        lv_obj_t *k = kb_keys_[r][c];
+        if (!k) return;
+        if (on) {
+            lv_obj_set_style_bg_color(k, lv_color_hex(BadgeTheme::ACCENT), 0);
+            lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(k, lv_color_hex(0x160a16), 0);
+        } else {
+            lv_obj_set_style_bg_color(k, lv_color_hex(0x2a2030), 0);
+            lv_obj_set_style_bg_opa(k, LV_OPA_50, 0);
+            lv_obj_set_style_text_color(k, lv_color_hex(BadgeTheme::TEXT), 0);
+        }
+    }
+
+    void kb_update_line()
+    {
+        if (kb_textline_) lv_label_set_text_fmt(kb_textline_, "%s_", kb_text_);
+    }
+
+    void open_keyboard()
+    {
+        if (kb_open_) return;
+        kb_open_ = true;
+        kb_len_ = 0; kb_text_[0] = '\0';
+        kb_row_ = 1; kb_col_ = 0;
+
+        if (chat_scroll_) lv_obj_add_flag(chat_scroll_, LV_OBJ_FLAG_HIDDEN);
+        if (chat_status_) lv_obj_add_flag(chat_status_, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_obj_add_flag(opt_lbl_[i], LV_OBJ_FLAG_HIDDEN);
+
+        kb_textline_ = lv_label_create(root_);
+        lv_obj_set_style_text_color(kb_textline_, lv_color_hex(BadgeTheme::TEXT), 0);
+        lv_obj_set_style_text_font(kb_textline_, &lv_font_montserrat_16, 0);
+        lv_label_set_long_mode(kb_textline_, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(kb_textline_, 304);
+        lv_obj_align(kb_textline_, LV_ALIGN_TOP_LEFT, 8, 30);
+        lv_label_set_text(kb_textline_, "_");
+
+        const int y0 = 74;
+        for (int r = 0; r < 5; r++) {
+            int len = (int)strlen(kKbRows[r]);
+            int rowy = y0 + r * 27;
+            if (r == 4) {
+                kb_keys_[4][0] = make_key("space", 60, rowy, 200, 24);
+            } else {
+                int x0 = 6 + ((10 - len) * 31) / 2;
+                for (int c = 0; c < len; c++) {
+                    char s[2] = { kKbRows[r][c], 0 };
+                    kb_keys_[r][c] = make_key(s, x0 + c * 31, rowy, 28, 24);
+                }
+            }
+        }
+
+        kb_hint_ = lv_label_create(root_);
+        lv_label_set_text(kb_hint_, "move   A type   B back   START send");
+        lv_obj_set_style_text_color(kb_hint_, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
+        lv_obj_set_style_text_font(kb_hint_, &lv_font_montserrat_14, 0);
+        lv_obj_align(kb_hint_, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+        kb_highlight(kb_row_, kb_col_, true);
+    }
+
+    void close_keyboard(bool send)
+    {
+        if (!kb_open_) return;
+        kb_open_ = false;
+        if (kb_textline_) { lv_obj_del(kb_textline_); kb_textline_ = nullptr; }
+        if (kb_hint_)     { lv_obj_del(kb_hint_);     kb_hint_ = nullptr; }
+        for (int r = 0; r < 5; r++)
+            for (int c = 0; c < 10; c++)
+                if (kb_keys_[r][c]) { lv_obj_del(kb_keys_[r][c]); kb_keys_[r][c] = nullptr; }
+
+        if (chat_status_) lv_obj_clear_flag(chat_status_, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < 3; i++) if (opt_lbl_[i]) lv_obj_clear_flag(opt_lbl_[i], LV_OBJ_FLAG_HIDDEN);
+        if (chat_scroll_) lv_obj_clear_flag(chat_scroll_, LV_OBJ_FLAG_HIDDEN);
+
+        if (send && kb_len_ > 0) {   // empty + Start = cancel
+            hist_add(true, kb_text_);
+            send_turn();
+        }
+    }
+
+    void kb_move(int dr, int dc)
+    {
+        kb_highlight(kb_row_, kb_col_, false);
+        if (dr) {
+            kb_row_ = clampi(kb_row_ + dr, 0, 4);
+            int len = (int)strlen(kKbRows[kb_row_]);
+            kb_col_ = clampi(kb_col_, 0, len - 1);
+        }
+        if (dc) {
+            int len = (int)strlen(kKbRows[kb_row_]);
+            kb_col_ = clampi(kb_col_ + dc, 0, len - 1);
+        }
+        kb_highlight(kb_row_, kb_col_, true);
+    }
+
+    void kb_type()
+    {
+        char ch = (kb_row_ == 4) ? ' ' : kKbRows[kb_row_][kb_col_];
+        if (kb_len_ < (int)sizeof(kb_text_) - 1) {
+            kb_text_[kb_len_++] = ch;
+            kb_text_[kb_len_] = '\0';
+            kb_update_line();
+        }
+    }
+
+    void kb_backspace()
+    {
+        if (kb_len_ > 0) { kb_text_[--kb_len_] = '\0'; kb_update_line(); }
     }
 
     void enter_chat(lv_obj_t *root)
@@ -614,12 +784,19 @@ private:
         }
 
         lv_obj_t *hint = lv_label_create(root);
-        lv_label_set_text(hint, "A / B / LEFT reply   up-dn scroll   HOME exit");
+        lv_label_set_text(hint, "A/B/LEFT pick   RIGHT type   HOME exit");
         lv_obj_set_style_text_color(hint, lv_color_hex(BadgeTheme::TEXT_DIM), 0);
         lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
         lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
 
         // Fresh conversation: seed a first user turn that nudges a warm greeting.
+        familiar_net_log_reset();
+        familiar_net_log("enter_chat");
+        // Create the persistent network worker NOW, while the heap still has a big
+        // contiguous block (Wi-Fi has not fragmented it yet). One 12KB stack for the
+        // whole session, reused every turn.
+        if (!chat_worker_)
+            xTaskCreate(&FamiliarApp::chat_worker_fn, "fam_chat", 12288, this, 5, &chat_worker_);
         hist_n_ = 0;
         hist_add(true, "I just opened you on my badge. Say hi and suggest what we could do!");
         send_turn();
@@ -863,7 +1040,7 @@ private:
     lv_obj_t *chat_status_ = nullptr, *chat_reply_ = nullptr, *chat_scroll_ = nullptr;
     lv_obj_t *opt_lbl_[3] = {nullptr, nullptr, nullptr};
     SemaphoreHandle_t chat_mu_ = nullptr;
-    TaskHandle_t chat_task_ = nullptr;
+    TaskHandle_t chat_worker_ = nullptr;   // one persistent turn-runner per session
     char chat_reply_buf_[1024] = {0};
     int  chat_reply_len_ = 0;
     char chat_status_buf_[80] = {0};
@@ -879,6 +1056,19 @@ private:
     int  hist_n_ = 0;
     char opt_[3][40] = {{0}};
     int  opt_n_ = 0;
+
+    // On-screen D-pad keyboard (type your own prompt). Modal over the chat screen:
+    // Right opens it, the D-pad moves a highlighted key, A types, B backspaces,
+    // Start sends (or cancels if empty). Built from plain labels so the highlight
+    // is fully under our control; there is no network up while typing.
+    static constexpr const char *kKbRows[5] = {
+        "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm.?", " "
+    };
+    bool kb_open_ = false;
+    char kb_text_[160] = {0};
+    int  kb_len_ = 0, kb_row_ = 1, kb_col_ = 0;
+    lv_obj_t *kb_keys_[5][10] = {{nullptr}};
+    lv_obj_t *kb_textline_ = nullptr, *kb_hint_ = nullptr;
 
     // System prompt: keep it free of double quotes and backslashes so it embeds in
     // the JSON body with no escaping. Claude ends each reply with an OPTS line we

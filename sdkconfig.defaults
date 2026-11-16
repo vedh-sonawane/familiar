@@ -146,3 +146,12 @@ CONFIG_LWIP_TCP_MSS=1200
 # config data after, so the Anthropic TLS session fits the fragmented heap.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# Software AES/GCM instead of the hardware engine. The HW AES driver allocates a
+# DMA-capable buffer per TLS record; with the heap down to ~8 KB while reading
+# Claude's reply, that alloc intermittently fails ("esp-aes: Failed to allocate
+# memory" -> esp_tls read error -0x0001 -> HTTP -1). Software AES uses the already
+# allocated mbedTLS context and needs no extra DMA buffer, so the read is reliable.
+# Our payloads are tiny, so the speed cost is negligible.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_GCM=n
